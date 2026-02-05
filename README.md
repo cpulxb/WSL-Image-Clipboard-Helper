@@ -9,7 +9,7 @@ Language: [中文说明](#中文说明) | [English Guide](#english-guide)
 ### 概述
 
 #### 背景
-当前许多智能编程 CLI Agent（如 Codex 、Amazon Q Developer CLI 等）主要针对 Linux 和 macOS 系统优化，Windows 用户想要体验这些工具，通常需要通过 WSL2（Windows Subsystem for Linux 2）来运行。然而，WSL2 在某些功能上的支持并不完善，**图片粘贴**就是其中一个典型痛点：
+当前许多智能编程 CLI Agent（如 Codex 、Amazon Q Developer CLI、OpenCode、Claude Code 等）主要针对 Linux 和 macOS 系统优化，Windows 用户想要体验这些工具，通常需要通过 WSL2（Windows Subsystem for Linux 2）来运行。然而，WSL2 在某些功能上的支持并不完善，**图片粘贴**就是其中一个典型痛点：
 
 - **问题**：WSL2 终端无法直接访问 Windows 剪贴板中的图片数据
 - **影响**：用户无法像在原生 Linux/macOS 中那样，直接将截图粘贴给 AI 工具进行分析
