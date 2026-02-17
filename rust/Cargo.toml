@@ -1,0 +1,63 @@
+[package]
+name = "wsl_clipboard"
+version = "2.0.0"
+edition = "2021"
+description = "WSL CLI Clipboard Helper - Fast image paste for AI agents"
+authors = ["liu"]
+
+[dependencies]
+# Windows 本地库 - 使用完整 features 以避免导入问题
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_DataExchange",
+    "Win32_System_Ole",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Input_Pointer",
+] }
+
+# 全局热键
+global-hotkey = "0.5"
+
+# 异步运行时
+tokio = { version = "1.38", features = ["full"] }
+
+# 配置管理
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+dirs = "5.0"
+
+# 错误处理
+anyhow = "1.0"
+thiserror = "1.0"
+
+# 图片处理 (可选)
+image = { version = "0.24", optional = true }
+png = "0.17"
+
+# 时间处理
+chrono = "0.4"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[features]
+default = ["image-support"]
+image-support = ["dep:image"]
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+opt-level = 3
+
+[profile.release.package."*"]
+opt-level = 3

@@ -1,0 +1,3 @@
+hotkey = "!Enter"
+runtime_mode = "safe"
+paste_format = "plain"

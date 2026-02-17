@@ -1,0 +1,6 @@
+[build]
+# 使用 Windows MSVC 目标（与已安装的 Rust 工具链一致）
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"

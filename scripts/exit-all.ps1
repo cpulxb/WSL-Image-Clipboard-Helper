@@ -35,9 +35,30 @@ foreach ($proc in $ahkProcs) {
     Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
 }
 
+# 匹配编译版插件进程（wsl_clipboard.exe 或备份版本）
+$helperExeProcs = $allProcs | Where-Object {
+    $_.Name -and $_.Name -like "wsl_clipboard*.exe"
+}
+
+if ($Verbose) {
+    Write-Host "`n🔍 匹配到的编译版插件进程：" -ForegroundColor Cyan
+    $helperExeProcs | ForEach-Object {
+        Write-Host " - PID=$($_.ProcessId) | $($_.Name) | $($_.ExecutablePath)" -ForegroundColor Gray
+    }
+}
+
+foreach ($proc in $helperExeProcs) {
+    Write-Host "🧹 结束编译版插件进程 PID=$($proc.ProcessId)" -ForegroundColor Yellow
+    Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+}
+
 # 匹配 PowerShell 剪贴板脚本进程（使用 CommandLine）
 $psProcs = $allProcs | Where-Object {
-    $_.CommandLine -and $_.CommandLine -like "*save-clipboard-image.ps1*"
+    $_.CommandLine -and (
+        $_.CommandLine -like "*save-clipboard-image.ps1*" -or
+        $_.CommandLine -like "*save-and-set-attachment.ps1*" -or
+        $_.CommandLine -like "*set-clipboard-attachment.ps1*"
+    )
 }
 
 if ($Verbose) {
