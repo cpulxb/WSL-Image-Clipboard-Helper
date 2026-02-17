@@ -29,6 +29,22 @@ Language: [中文说明](#中文说明) | [English Guide](#english-guide)
 - 🖱️ 托盘管理：支持切换热键、切换运行模式、打开缓存目录、退出程序
 - 🛡️ 图片读取边界保护：对 DIB 头与内存大小做安全校验，避免异常数据导致崩溃
 
+![clip_20260217_184919_809](.\img\clip_20260217_184919_809.png)
+
+以这张图为例子，粘贴到Codex,Claude Code,OpenCode均正常(其他Agent工具可自行尝试)，粘贴的时候会自动识别成`[Image #n]` 的这种格式，不能转换成这个格式的时候，就会以路径的形式显示在输入框中
+
+`codex`
+
+![image-20260217185539242](.\img\image-20260217185539242.png)
+
+`claude`
+
+![image-20260217185656617](.\img\Snipaste_2026-02-17_18-56-35.jpg)
+
+`openCode`
+
+![image-20260217185731979](.\img\image-20260217185731979.png)
+
 ### 🧰 必备环境
 
 - Windows 10/11，已启用 WSL2
@@ -194,6 +210,22 @@ Current mainline release is Rust-based (`v4.0`), focused on reliability and main
 - 🧹 Automatic cleanup for temporary PNG files
 - 🛡️ Safer clipboard parsing with memory-bound checks
 
+![clip_20260217_184919_809](.\img\clip_20260217_184919_809.png)
+
+Using this image as an example, pasting works correctly in Codex, Claude Code, and OpenCode (you can also try other agent tools). During paste, many tools render it as `[Image #n]`; when that rendering path is unavailable, the input falls back to showing the file path in the text box.
+
+`codex`
+
+![image-20260217185539242](.\img\image-20260217185539242.png)
+
+`claude`
+
+![image-20260217185656617](.\img\Snipaste_2026-02-17_18-56-35.jpg)
+
+`openCode`
+
+![image-20260217185731979](.\img\image-20260217185731979.png)
+
 ### 🧰 Requirements
 
 - Windows 10/11 with WSL2
@@ -226,7 +258,9 @@ WSL-Image-Clipboard-Helper/
    [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases)
 2. Put `wsl_clipboard.exe` in a fixed folder (ideally with `temp/` and `wsl_clipboard.toml`).
 3. Launch `wsl_clipboard.exe`.
-4. Press hotkey (default `Alt+V`) in any editable field.
+4. Press hotkey (default `Alt+V`) in any editable field:
+   - With image in clipboard: save to `temp/` and paste the `/mnt/...` path.
+   - Without image in clipboard: automatically fall back to normal paste (`Ctrl+V`).
 5. Use tray menu for hotkey/mode switch and exit.
 
 If you prefer building from source:
