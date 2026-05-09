@@ -26,7 +26,7 @@ Language: [中文说明](#中文说明) | [English Guide](#english-guide)
 - ⚡ 图片异步保存：路径先可用，图片文件后台写入，降低主流程阻塞
 - 🌐 输入法保护（安全模式）：粘贴前切英文输入法，结束后自动恢复
 - 🧹 自动清理机制：周期清理过期 PNG，退出时清理临时图片
-- 🖱️ 托盘管理：支持切换热键、切换运行模式、打开缓存目录、退出程序
+- 🖱️ 托盘管理：支持切换热键、切换运行模式、打开临时图片目录、退出并清理临时图片
 - 🛡️ 图片读取边界保护：对 DIB 头与内存大小做安全校验，避免异常数据导致崩溃
 
 ![clip_20260217_184919_809](./img/clip_20260217_184919_809.png)
@@ -93,7 +93,7 @@ WSL-Image-Clipboard-Helper/
 
 5. 通过托盘菜单切换热键与运行模式。
 
-6. 退出时从托盘菜单选择 `Exit`。
+6. 退出时从托盘菜单选择 `退出并清理临时图片`，会删除 `temp/` 下的临时 PNG 文件。
 
 如需自行编译，再使用下面的源码方式：
 
@@ -109,7 +109,8 @@ WSL-Image-Clipboard-Helper/
 
 - 默认热键是 `Alt+V`，可在托盘菜单中切换为 `Ctrl+Alt+V` 或 `Alt+Enter`
 - 运行配置保存在 `wsl_clipboard.toml`（与可执行文件同目录）
-- 若遇到输入法导致的粘贴错乱，切回 `safe` 模式
+- 托盘菜单中的 `退出并清理临时图片` 会删除 `temp/` 下的临时 PNG 文件
+- 若遇到输入法导致的粘贴错乱，切回 `兼容模式（输入法保护）`
 - 若托盘图标未显示，请检查任务栏隐藏图标区域
 
 ### 🛠️ Rust 版本编译（推荐）
@@ -261,7 +262,15 @@ WSL-Image-Clipboard-Helper/
 4. Press hotkey (default `Alt+V`) in any editable field:
    - With image in clipboard: save to `temp/` and paste the `/mnt/...` path.
    - Without image in clipboard: automatically fall back to normal paste (`Ctrl+V`).
-5. Use tray menu for hotkey/mode switch and exit.
+5. Use the tray menu for hotkey/mode switch and choose `Exit and clean temporary images` when exiting.
+
+### ⚠️ Notes
+
+- The default hotkey is `Alt+V`; the tray menu can switch it to `Ctrl+Alt+V` or `Alt+Enter`.
+- Runtime settings are stored in `wsl_clipboard.toml` next to the executable.
+- `Exit and clean temporary images` removes temporary PNG files under `temp/`.
+- If IME state causes paste issues, switch back to `Compatibility mode (IME guard)`.
+- If the tray icon is not visible, check the hidden icons area in the Windows taskbar.
 
 If you prefer building from source:
 
