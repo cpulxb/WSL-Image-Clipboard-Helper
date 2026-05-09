@@ -6,9 +6,10 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, GetClipboardData, OpenClipboard,
 };
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
-use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5};
+use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_HDROP};
+use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 
-use tracing::info;
+use tracing::{info, warn};
 
 #[link(name = "user32")]
 extern "system" {
@@ -55,6 +56,25 @@ impl ClipboardManager {
             IsClipboardFormatAvailable(CF_BITMAP.0 as u32) != 0
                 || IsClipboardFormatAvailable(CF_DIB.0 as u32) != 0
                 || IsClipboardFormatAvailable(CF_DIBV5.0 as u32) != 0
+        }
+    }
+
+    pub fn has_file_list(&self) -> bool {
+        unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32) != 0 }
+    }
+
+    pub fn read_file_list_for_paste(&self) -> Option<String> {
+        let paths = self.get_file_paths()?;
+        let wsl_paths: Vec<String> = paths
+            .iter()
+            .map(|path| convert_path_to_wsl(path))
+            .filter(|path| !path.is_empty())
+            .collect();
+
+        if wsl_paths.is_empty() {
+            None
+        } else {
+            Some(wsl_paths.join("\n"))
         }
     }
 
@@ -110,6 +130,28 @@ impl ClipboardManager {
         Some((win_path, wsl_path, png_data))
     }
 
+    fn get_file_paths(&self) -> Option<Vec<String>> {
+        unsafe {
+            if OpenClipboard(None).is_err() {
+                return None;
+            }
+
+            let paths = if let Ok(h_data) = GetClipboardData(CF_HDROP.0 as u32) {
+                Self::read_hdrop_paths(HDROP(h_data.0 as isize))
+            } else {
+                Vec::new()
+            };
+
+            CloseClipboard().ok();
+
+            if paths.is_empty() {
+                None
+            } else {
+                Some(paths)
+            }
+        }
+    }
+
     /// 获取图片数据并转换为 PNG
     fn get_image_data(&self) -> Option<Vec<u8>> {
         unsafe {
@@ -138,6 +180,29 @@ impl ClipboardManager {
 
             None
         }
+    }
+
+    unsafe fn read_hdrop_paths(hdrop: HDROP) -> Vec<String> {
+        let count = DragQueryFileW(hdrop, u32::MAX, None);
+        let mut paths = Vec::new();
+
+        for index in 0..count {
+            let len = DragQueryFileW(hdrop, index, None);
+            if len == 0 {
+                continue;
+            }
+
+            let mut buffer = vec![0u16; len as usize + 1];
+            let copied = DragQueryFileW(hdrop, index, Some(&mut buffer));
+            if copied == 0 {
+                warn!("读取剪贴板文件路径失败: index={}", index);
+                continue;
+            }
+
+            paths.push(String::from_utf16_lossy(&buffer[..copied as usize]));
+        }
+
+        paths
     }
 
     /// 从剪贴板读取 DIB 数据

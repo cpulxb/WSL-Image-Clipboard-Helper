@@ -1,3 +1,4 @@
+use crate::cleanup;
 use crate::config::{AppConfig, RuntimeMode};
 use crate::hotkey::{HotkeyManager, HotkeyType};
 use anyhow::{Context, Result};
@@ -5,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use tracing::{error, info, warn};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -15,6 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// 托盘图标回调消息
 const WM_TRAYICON: u32 = WM_APP + 100;
+const APP_ICON_ID: u16 = 1;
 
 /// 菜单命令 ID
 const CMD_HOTKEY_ALTV: u32 = 1001;
@@ -40,6 +42,8 @@ struct TrayState {
     config: AppConfig,
     hotkey_manager: HotkeyManager,
     cmd_tx: std_mpsc::Sender<TrayCommand>,
+    temp_dir: PathBuf,
+    session_end_cleanup_done: bool,
 }
 
 // 全局状态指针（仅托盘线程访问）
@@ -51,16 +55,20 @@ pub struct TrayController;
 impl TrayController {
     /// 启动托盘线程，返回命令接收端和一个 join handle
     /// 热键管理器在托盘线程上创建（需要 Win32 消息循环）
-    pub fn start(config: AppConfig) -> Result<std_mpsc::Receiver<TrayCommand>> {
+    pub fn start(
+        config: AppConfig,
+        temp_dir: PathBuf,
+    ) -> Result<std_mpsc::Receiver<TrayCommand>> {
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<TrayCommand>();
 
         let config_clone = config.clone();
+        let temp_dir_clone = temp_dir.clone();
         let tx = cmd_tx.clone();
 
         std::thread::Builder::new()
             .name("tray-thread".to_string())
             .spawn(move || {
-                if let Err(e) = run_tray_thread(config_clone, tx) {
+                if let Err(e) = run_tray_thread(config_clone, temp_dir_clone, tx) {
                     error!("托盘线程异常退出: {}", e);
                 }
             })
@@ -70,8 +78,17 @@ impl TrayController {
     }
 }
 
+unsafe fn load_app_icon(h_instance: HINSTANCE) -> windows::core::Result<HICON> {
+    LoadIconW(h_instance, PCWSTR(APP_ICON_ID as usize as *const u16))
+        .or_else(|_| LoadIconW(HINSTANCE::default(), IDI_APPLICATION))
+}
+
 /// 托盘线程主函数
-fn run_tray_thread(config: AppConfig, cmd_tx: std_mpsc::Sender<TrayCommand>) -> Result<()> {
+fn run_tray_thread(
+    config: AppConfig,
+    temp_dir: PathBuf,
+    cmd_tx: std_mpsc::Sender<TrayCommand>,
+) -> Result<()> {
     unsafe {
         let h_instance = GetModuleHandleW(None)?;
 
@@ -116,7 +133,7 @@ fn run_tray_thread(config: AppConfig, cmd_tx: std_mpsc::Sender<TrayCommand>) -> 
         nid.uID = 1;
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_TRAYICON;
-        nid.hIcon = LoadIconW(None, IDI_APPLICATION)?;
+        nid.hIcon = load_app_icon(h_instance.into())?;
 
         // 设置 tooltip
         set_tooltip(&mut nid, &config);
@@ -139,6 +156,8 @@ fn run_tray_thread(config: AppConfig, cmd_tx: std_mpsc::Sender<TrayCommand>) -> 
             config,
             hotkey_manager,
             cmd_tx,
+            temp_dir,
+            session_end_cleanup_done: false,
         });
 
         TRAY_STATE = &mut *state as *mut TrayState;
@@ -176,8 +195,8 @@ fn set_tooltip(nid: &mut NOTIFYICONDATAW, config: &AppConfig) {
         .unwrap_or("Alt+V");
 
     let mode_display = match &config.runtime_mode {
-        RuntimeMode::Safe => "稳定",
-        RuntimeMode::Fast => "极速",
+        RuntimeMode::Safe => "兼容",
+        RuntimeMode::Fast => "快速",
     };
 
     let tip = format!("WSL Clipboard ({} | {})", hotkey_display, mode_display);
@@ -208,7 +227,39 @@ unsafe extern "system" fn tray_wnd_proc(
         return LRESULT(0);
     }
 
+    if msg == WM_QUERYENDSESSION {
+        return LRESULT(1);
+    }
+
+    if msg == WM_ENDSESSION {
+        if wparam.0 != 0 {
+            handle_session_end();
+        }
+        return LRESULT(0);
+    }
+
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+unsafe fn handle_session_end() {
+    if TRAY_STATE.is_null() {
+        return;
+    }
+
+    let state = &mut *TRAY_STATE;
+    if state.session_end_cleanup_done {
+        return;
+    }
+
+    state.session_end_cleanup_done = true;
+    info!("收到 Windows 会话结束消息，开始清理临时文件");
+
+    if let Err(e) = cleanup::cleanup_temp_png(&state.temp_dir) {
+        warn!("会话结束清理临时文件失败: {}", e);
+    }
+
+    let _ = state.cmd_tx.send(TrayCommand::Exit);
+    PostQuitMessage(0);
 }
 
 /// 显示右键菜单
@@ -245,7 +296,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
         let _ = AppendMenuW(h_hotkey_menu, flags, cmd_id as usize, PCWSTR::from_raw(label_w.as_ptr()));
     }
 
-    let hotkey_label: Vec<u16> = "切换快捷键\0".encode_utf16().collect();
+    let hotkey_label: Vec<u16> = "快捷键\0".encode_utf16().collect();
     let _ = AppendMenuW(h_menu, MF_POPUP, h_hotkey_menu.0 as usize, PCWSTR::from_raw(hotkey_label.as_ptr()));
 
     // ---- 模式子菜单 ----
@@ -256,11 +307,11 @@ unsafe fn show_context_menu(hwnd: HWND) {
 
     let is_safe = matches!(state.config.runtime_mode, RuntimeMode::Safe);
 
-    let safe_label: Vec<u16> = "稳定模式（输入法保护）\0".encode_utf16().collect();
+    let safe_label: Vec<u16> = "兼容模式（输入法保护）\0".encode_utf16().collect();
     let safe_flags = MF_STRING | if is_safe { MF_CHECKED } else { MF_UNCHECKED };
     let _ = AppendMenuW(h_mode_menu, safe_flags, CMD_MODE_SAFE as usize, PCWSTR::from_raw(safe_label.as_ptr()));
 
-    let fast_label: Vec<u16> = "极速模式（更快）\0".encode_utf16().collect();
+    let fast_label: Vec<u16> = "快速模式（低延迟）\0".encode_utf16().collect();
     let fast_flags = MF_STRING | if !is_safe { MF_CHECKED } else { MF_UNCHECKED };
     let _ = AppendMenuW(h_mode_menu, fast_flags, CMD_MODE_FAST as usize, PCWSTR::from_raw(fast_label.as_ptr()));
 
@@ -271,14 +322,14 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let _ = AppendMenuW(h_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
     // ---- 打开缓存 ----
-    let folder_label: Vec<u16> = "打开图片缓存\0".encode_utf16().collect();
+    let folder_label: Vec<u16> = "打开临时图片目录\0".encode_utf16().collect();
     let _ = AppendMenuW(h_menu, MF_STRING, CMD_OPEN_FOLDER as usize, PCWSTR::from_raw(folder_label.as_ptr()));
 
     // ---- 分隔线 ----
     let _ = AppendMenuW(h_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
     // ---- 退出 ----
-    let exit_label: Vec<u16> = "退出\0".encode_utf16().collect();
+    let exit_label: Vec<u16> = "退出并清理临时图片\0".encode_utf16().collect();
     let _ = AppendMenuW(h_menu, MF_STRING, CMD_EXIT as usize, PCWSTR::from_raw(exit_label.as_ptr()));
 
     // 显示菜单
@@ -367,11 +418,7 @@ unsafe fn switch_mode(state: &mut TrayState, mode: RuntimeMode) {
 
 /// 打开临时文件夹
 pub fn open_temp_folder() -> Result<()> {
-    let temp_dir = std::env::current_exe()
-        .context("获取可执行文件路径失败")?
-        .parent()
-        .map(|p| p.join("temp"))
-        .unwrap_or_else(|| PathBuf::from(".\\temp"));
+    let temp_dir = cleanup::temp_dir_from_current_exe()?;
 
     if temp_dir.exists() {
         std::process::Command::new("explorer.exe")
