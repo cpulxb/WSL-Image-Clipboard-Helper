@@ -1,6 +1,22 @@
-# WSL Image Clipboard Helper
+<a id="wsl-image-clipboard-helper"></a>
 
-Language: [中文说明](#中文说明) | [English Guide](#english-guide)
+<p align="center">
+  <img src="img/logo.png" alt="WSL Image Clipboard Helper logo" width="128" height="128">
+</p>
+
+<h1 align="center">WSL Image Clipboard Helper</h1>
+
+<p align="center">
+  One hotkey to turn Windows clipboard images into WSL-ready paths for AI CLI tools.
+</p>
+
+<p align="center">
+  <a href="https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest">Release</a>
+  ·
+  <a href="#中文说明">中文</a>
+  ·
+  <a href="#english-guide">English</a>
+</p>
 
 ---
 
