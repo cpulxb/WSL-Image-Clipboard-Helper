@@ -18,7 +18,7 @@ Language: [中文说明](#中文说明) | [English Guide](#english-guide)
 #### ✅ 解决方案
 本工具用于弥补这个缺口：通过全局快捷键（默认 `Alt+V`），自动读取 Windows 剪贴板图片，保存到本地 `temp/` 目录，并把对应 WSL 路径（`/mnt/c/...`）粘贴到当前输入窗口，让 AI 工具可以直接消费图片文件。
 
-当前主版本是 Rust 实现（`v4.0`），在保持原有使用习惯的前提下，重点提升稳定性与可维护性。
+当前主版本是 Rust 实现（`v4.0`）。推荐直接下载 GitHub Release `v4.0` 或 latest release 中的预编译版本。
 
 ### ✨ 核心特性
 
@@ -28,6 +28,8 @@ Language: [中文说明](#中文说明) | [English Guide](#english-guide)
 - 🧹 自动清理机制：周期清理过期 PNG，退出时清理临时图片
 - 🖱️ 托盘管理：支持切换热键、切换运行模式、打开临时图片目录、退出并清理临时图片
 - 🛡️ 图片读取边界保护：对 DIB 头与内存大小做安全校验，避免异常数据导致崩溃
+- 🪟 Windows 集成：内嵌多尺寸图标，并带 DPI-aware manifest，高 DPI 环境显示更稳定
+- 📁 Explorer 路径转换：在资源管理器复制文件后按 `Alt+V`，会粘贴对应 `/mnt/...` 路径
 
 ![clip_20260217_184919_809](./img/clip_20260217_184919_809.png)
 
@@ -71,8 +73,9 @@ WSL-Image-Clipboard-Helper/
 
 ### 🚀 使用方式（Rust 版本）
 
-1. 最简单方式（推荐）：从 Releases 下载已编译 `wsl_clipboard.exe`：  
-   [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases)
+1. 最简单方式（推荐）：从 GitHub Release 下载已编译版本：
+   - `v4.0`：[https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.0](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.0)
+   - latest release：[https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest)
 
 2. 将下载的 `wsl_clipboard.exe` 放到一个固定目录。
 
@@ -90,6 +93,7 @@ WSL-Image-Clipboard-Helper/
 4. 在任意可编辑输入框按下快捷键（默认 `Alt+V`）：
    - 有图片：保存到 `temp/`，并粘贴 `/mnt/...` 路径
    - 无图片：自动回退普通粘贴（`Ctrl+V`）
+   - 在 Explorer 中先复制文件，再按 `Alt+V`：粘贴转换后的 WSL 路径（例如 `/mnt/c/...`）
 
 5. 通过托盘菜单切换热键与运行模式。
 
@@ -167,6 +171,8 @@ cargo clean
 - 增加剪贴板内存边界校验，避免越界读取风险
 - 热键切换加入回滚机制，避免切换失败后无热键可用
 - 异常分支补齐剪贴板释放，降低资源占用风险
+- 内嵌多尺寸应用图标，并增加 DPI-aware manifest
+- 支持 Explorer 复制文件后用 `Alt+V` 转换并粘贴 `/mnt/...` 路径
 
 #### v3.0（HotKey 改版，AHK） 🔁
 
@@ -200,7 +206,7 @@ Many AI CLI agents (Codex, Amazon Q Developer CLI, OpenCode, Claude Code, etc.) 
 #### ✅ Solution
 This project automates that workaround with a global hotkey (default `Alt+V`): it captures clipboard image data, saves a PNG file, and pastes the WSL path (`/mnt/...`) into the active input control.
 
-Current mainline release is Rust-based (`v4.0`), focused on reliability and maintainability.
+Current mainline release is Rust-based (`v4.0`). The recommended path is to download the prebuilt GitHub Release `v4.0` or the latest release.
 
 ### ✨ Highlights
 
@@ -210,6 +216,8 @@ Current mainline release is Rust-based (`v4.0`), focused on reliability and main
 - 🖱️ Tray-based hotkey and mode switching
 - 🧹 Automatic cleanup for temporary PNG files
 - 🛡️ Safer clipboard parsing with memory-bound checks
+- 🪟 Embedded multi-size app icons and a DPI-aware manifest
+- 📁 Explorer file path conversion: copy files in Explorer, then press `Alt+V` to paste `/mnt/...` paths
 
 ![clip_20260217_184919_809](./img/clip_20260217_184919_809.png)
 
@@ -255,13 +263,15 @@ WSL-Image-Clipboard-Helper/
 
 ### 🚀 Usage (Rust version)
 
-1. Easiest way (recommended): download prebuilt `wsl_clipboard.exe` from Releases:  
-   [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases)
+1. Easiest way (recommended): download the prebuilt package from GitHub Releases:
+   - `v4.0`: [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.0](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.0)
+   - latest release: [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest)
 2. Put `wsl_clipboard.exe` in a fixed folder (ideally with `temp/` and `wsl_clipboard.toml`).
 3. Launch `wsl_clipboard.exe`.
 4. Press hotkey (default `Alt+V`) in any editable field:
    - With image in clipboard: save to `temp/` and paste the `/mnt/...` path.
    - Without image in clipboard: automatically fall back to normal paste (`Ctrl+V`).
+   - In Explorer, copy one or more files, then press `Alt+V` to paste their WSL paths, such as `/mnt/c/...`.
 5. Use the tray menu for hotkey/mode switch and choose `Exit and clean temporary images` when exiting.
 
 ### ⚠️ Notes
@@ -304,7 +314,7 @@ cargo clean
 
 ### 🕒 Version Line
 
-- `v4.0`: Rust mainline release (current)
+- `v4.0`: Rust mainline release with embedded multi-size icons, DPI-aware manifest, and Explorer-to-WSL path paste
 - `v3.0`: Hotkey-focused revision on AHK
 - `v2.0`: AHK path-first optimization
 - `v1.0`: AHK baseline
