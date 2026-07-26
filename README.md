@@ -91,7 +91,7 @@ WSL-Image-Clipboard-Helper/
 ### 🚀 使用方式（Rust 版本）
 
 1. 最简单方式（推荐）：从 GitHub Release 下载已编译版本：
-   - `v4.1`：[https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.1](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.1)
+   - `v4.1.1`：[https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.1.1](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.1.1)
    - latest release：[https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest)
 
 2. 将下载的 `wsl_clipboard.exe` 放到一个固定目录。
@@ -209,7 +209,11 @@ cargo clean
 
 ### 🕒 版本历史
 
-#### v4.1（当前版本，Rust） ✅
+#### v4.1.1（当前版本，Rust） ✅
+
+- 修复 32 位剪贴板 DIB 的保留字节（全 0）被当作 alpha 导致保存的 PNG 全透明的问题：alpha 全 0 时按不透明处理（与浏览器对剪贴板 DIB 的启发式一致）
+
+#### v4.1（Rust） ✅
 
 - 修复偶发"粘贴出原始路径而非 `[Image #n]`"：改为图片先落盘、路径后粘贴，消除文件存在性竞态（#4）
 - 新增 `路径格式` 托盘选项：纯路径 / `@` 前缀 / 引号包裹，适配 Kimi Code CLI、Gemini CLI、Qwen Code 等（#5）
@@ -318,7 +322,7 @@ WSL-Image-Clipboard-Helper/
 ### 🚀 Usage (Rust version)
 
 1. Easiest way (recommended): download the prebuilt package from GitHub Releases:
-   - `v4.1`: [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.1](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.1)
+   - `v4.1.1`: [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.1.1](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.1.1)
    - latest release: [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest)
 2. Put `wsl_clipboard.exe` in a fixed folder (ideally with `temp/` and `wsl_clipboard.toml`).
 3. Launch `wsl_clipboard.exe`.
@@ -387,6 +391,7 @@ cargo clean
 
 ### 🕒 Version Line
 
+- `v4.1.1`: treat all-zero alpha in 32-bit clipboard DIBs as opaque so saved PNGs are not fully transparent
 - `v4.1`: save-before-paste ordering fix (#4), switchable path style incl. `@` references for Kimi/Gemini/Qwen (#5), hardened key injection (#2)
 - `v4.0`: Rust mainline release with embedded multi-size icons, DPI-aware manifest, and Explorer-to-WSL path paste
 - `v3.0`: Hotkey-focused revision on AHK

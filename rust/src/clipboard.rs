@@ -306,6 +306,7 @@ impl ClipboardManager {
 
         let capacity = width.checked_mul(height)?.checked_mul(channels)?;
         let mut img_data = Vec::with_capacity(capacity);
+        let mut alpha_any_nonzero = false;
 
         // DIB bottom-up 时行从下到上存储
         for y in 0..height {
@@ -325,9 +326,22 @@ impl ClipboardManager {
                     img_data.push(b);
 
                     if has_alpha {
-                        img_data.push(pixel_data[pixel_start + 3]);
+                        let a = pixel_data[pixel_start + 3];
+                        if a != 0 {
+                            alpha_any_nonzero = true;
+                        }
+                        img_data.push(a);
                     }
                 }
+            }
+        }
+
+        // 32 位 BI_RGB DIB 的第 4 字节在很多来源里是保留填充（恒为 0）而非真实 alpha；
+        // 若整张图 alpha 全 0，按不透明处理（与浏览器处理剪贴板 DIB 的启发式一致），
+        // 否则导出的 PNG 全透明，AI 工具读到的是一张"空白图"
+        if has_alpha && !alpha_any_nonzero {
+            for a in img_data.iter_mut().skip(3).step_by(4) {
+                *a = 255;
             }
         }
 
