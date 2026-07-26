@@ -191,6 +191,12 @@ cd rust
 cargo clean
 ```
 
+在非 Windows 宿主（Linux/macOS）上执行 `cargo check` / `cargo clippy` 前，需先安装交叉编译 target（`rust/.cargo/config.toml` 默认指向 `x86_64-pc-windows-msvc`）：
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+```
+
 ### 🔧 AHK 编译（仅维护 V3.0 时需要）
 
 如果你在维护 `v3.0` 的 AHK 分支，可用 Ahk2Exe 重新编译：
@@ -206,6 +212,7 @@ cargo clean
 
 - [技术架构与流程说明](docs/architecture_by_codex.md)
 - [V3.0/V4.0 重构说明](docs/rust-refactor-v3-v4.md)
+- [v4.1 终端图片粘贴场景实测报告](docs/paste-scenario-test-report.md)
 
 ### 🕒 版本历史
 
