@@ -1,0 +1,121 @@
+# 发布工作流：在 windows-latest 上编译 Rust 版本并发布 GitHub Release
+#
+# 触发方式：
+#   1. 推送 v* 标签（如 v4.1）→ 构建并创建同名 Release
+#   2. 手动 workflow_dispatch：
+#      - tag 留空 → 仅构建并上传 artifact（用于验证构建）
+#      - tag 填写（如 v4.1）→ 构建并在当前 commit 上创建标签与 Release
+#
+# Release 说明取自 .github/release-notes/<tag>.md（首行 `# 标题` 作为 Release 标题），
+# 找不到对应文件时使用自动生成的说明；SHA256 校验值由工作流追加。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "发布用标签（如 v4.1）。留空则只构建，不创建 Release"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        run: rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+
+      - name: 编译（release）
+        working-directory: rust
+        run: cargo build --release --target x86_64-pc-windows-msvc --locked
+
+      - name: 打包
+        id: package
+        shell: pwsh
+        run: |
+          $tag = '${{ inputs.tag }}'
+          if (-not $tag) {
+            $tag = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { 'dev' }
+          }
+
+          $dir = 'WSL-Image-Clipboard-Helper'
+          New-Item -ItemType Directory -Path "$dir/temp" -Force | Out-Null
+          Copy-Item rust/target/x86_64-pc-windows-msvc/release/wsl_clipboard.exe "$dir/"
+          Copy-Item README.md "$dir/"
+          @'
+          hotkey = "!v"
+          runtime_mode = "fast"
+          paste_format = "plain"
+          path_style = "plain"
+          '@ | Set-Content -Encoding utf8 "$dir/wsl_clipboard.toml"
+          # 占位文件保证空的 temp/ 目录被打进压缩包
+          New-Item -ItemType File -Path "$dir/temp/.keep" -Force | Out-Null
+
+          $zip = "WSL-Image-Clipboard-Helper-$tag.zip"
+          Compress-Archive -Path $dir -DestinationPath $zip -Force
+
+          $zipHash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          $exeHash = (Get-FileHash "$dir/wsl_clipboard.exe" -Algorithm SHA256).Hash.ToLower()
+          "tag=$tag" | Add-Content $env:GITHUB_OUTPUT
+          "zip=$zip" | Add-Content $env:GITHUB_OUTPUT
+          "zip_sha256=$zipHash" | Add-Content $env:GITHUB_OUTPUT
+          "exe_sha256=$exeHash" | Add-Content $env:GITHUB_OUTPUT
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: WSL-Image-Clipboard-Helper-${{ steps.package.outputs.tag }}
+          path: ${{ steps.package.outputs.zip }}
+
+      - name: 创建 GitHub Release
+        if: github.ref_type == 'tag' || inputs.tag != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.package.outputs.tag }}
+          ZIP: ${{ steps.package.outputs.zip }}
+          ZIP_SHA256: ${{ steps.package.outputs.zip_sha256 }}
+          EXE_SHA256: ${{ steps.package.outputs.exe_sha256 }}
+        run: |
+          $title = $env:TAG
+          $notesPath = ".github/release-notes/$($env:TAG).md"
+          if (Test-Path $notesPath) {
+            $lines = Get-Content $notesPath
+            if ($lines.Count -gt 0 -and $lines[0] -like '# *') {
+              $title = $lines[0].Substring(2).Trim()
+              $lines = $lines | Select-Object -Skip 1
+            }
+            $notes = ($lines -join "`n").Trim()
+          } else {
+            $notes = "Automated release build for $($env:TAG)."
+          }
+
+          $checksums = @(
+            ''
+            '## Checksums'
+            ''
+            '```text'
+            "SHA256  $($env:ZIP)"
+            $env:ZIP_SHA256
+            ''
+            'SHA256  wsl_clipboard.exe'
+            $env:EXE_SHA256
+            '```'
+          ) -join "`n"
+          $notes = $notes + "`n" + $checksums
+          $notes | Set-Content -Encoding utf8 release-notes.md
+
+          gh release view $env:TAG 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG $env:ZIP --clobber
+            gh release edit $env:TAG --title $title --notes-file release-notes.md
+          } else {
+            gh release create $env:TAG $env:ZIP --title $title --notes-file release-notes.md --target $env:GITHUB_SHA
+          }
