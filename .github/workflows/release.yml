@@ -2,7 +2,10 @@
 #
 # 触发方式：
 #   1. 推送 v* 标签（如 v4.1）→ 构建并创建同名 Release
-#   2. 推送 main / claude/** 分支 → 仅构建并上传 artifact（构建验证）
+#   2. 推送 main / claude/** 分支 → 构建并上传 artifact（构建验证）；
+#      若 .github/RELEASE_TAG 文件里声明的版本（如 v4.1）尚未发布，
+#      则在当前 commit 上创建该标签与 Release（只创建一次，已存在则跳过，
+#      适用于无法直接推标签的受限环境）
 #   3. 手动 workflow_dispatch（工作流文件合入默认分支后可用）：
 #      - tag 留空 → 仅构建并上传 artifact
 #      - tag 填写（如 v4.1）→ 构建并在当前 commit 上创建标签与 Release
@@ -43,9 +46,17 @@ jobs:
         shell: pwsh
         run: |
           $tag = '${{ inputs.tag }}'
-          if (-not $tag) {
-            $tag = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { 'dev' }
+          if (-not $tag -and '${{ github.ref_type }}' -eq 'tag') {
+            $tag = '${{ github.ref_name }}'
           }
+          $fromMarker = 'false'
+          $marker = '.github/RELEASE_TAG'
+          if (-not $tag -and (Test-Path $marker)) {
+            $m = (Get-Content $marker -Raw).Trim()
+            if ($m) { $tag = $m; $fromMarker = 'true' }
+          }
+          if (-not $tag) { $tag = 'dev' }
+          "from_marker=$fromMarker" | Add-Content $env:GITHUB_OUTPUT
 
           $dir = 'WSL-Image-Clipboard-Helper'
           New-Item -ItemType Directory -Path "$dir/temp" -Force | Out-Null
@@ -77,7 +88,7 @@ jobs:
           path: ${{ steps.package.outputs.zip }}
 
       - name: 创建 GitHub Release
-        if: github.ref_type == 'tag' || inputs.tag != ''
+        if: github.ref_type == 'tag' || inputs.tag != '' || steps.package.outputs.from_marker == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -85,7 +96,16 @@ jobs:
           ZIP: ${{ steps.package.outputs.zip }}
           ZIP_SHA256: ${{ steps.package.outputs.zip_sha256 }}
           EXE_SHA256: ${{ steps.package.outputs.exe_sha256 }}
+          FROM_MARKER: ${{ steps.package.outputs.from_marker }}
         run: |
+          # RELEASE_TAG 标记文件路径只负责“首次发布”；已存在的 Release 不再改动，
+          # 避免后续分支推送用新构建覆盖旧标签对应的资产
+          gh release view $env:TAG 2>$null
+          if ($LASTEXITCODE -eq 0 -and $env:FROM_MARKER -eq 'true') {
+            Write-Host "Release $($env:TAG) 已存在，RELEASE_TAG 触发路径跳过更新"
+            exit 0
+          }
+
           $title = $env:TAG
           $notesPath = ".github/release-notes/$($env:TAG).md"
           if (Test-Path $notesPath) {
