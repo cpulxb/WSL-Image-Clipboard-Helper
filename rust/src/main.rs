@@ -165,6 +165,10 @@ async fn handle_paste(
     path_style: PathStyle,
     english_hkl: HKL,
 ) -> Result<()> {
+    // 0. 立即注入菜单屏蔽键：赶在物理 Alt 抬起之前，
+    //    避免目标窗口把"Alt 按下→抬起"当成单击 Alt 激活菜单栏
+    paste::mask_alt_tap();
+
     // 1. 检查剪贴板是否有图片
     if !clipboard_manager.has_image() {
         if clipboard_manager.has_file_list() {
