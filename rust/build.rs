@@ -3,6 +3,15 @@ fn main() {
         return;
     }
 
+    // 资源编译依赖 Windows 上的 rc 工具链；
+    // 非 Windows 宿主跳过图标/manifest 嵌入，保证交叉 cargo check/clippy 可用
+    if std::env::var("HOST")
+        .map(|h| !h.contains("windows"))
+        .unwrap_or(true)
+    {
+        return;
+    }
+
     let mut resource = winresource::WindowsResource::new();
     resource.set_icon("assets/wsl_clipboard.ico");
     resource.set_manifest_file("app.manifest");

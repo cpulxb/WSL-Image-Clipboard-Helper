@@ -6,8 +6,8 @@ use windows::Win32::System::DataExchange::{
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL,
-    VK_LMENU, VK_MENU, VK_SHIFT, VK_V,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    VIRTUAL_KEY, VK_CONTROL, VK_LMENU, VK_MENU, VK_RMENU, VK_SHIFT, VK_V,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowThreadProcessId, PostMessageW,
@@ -97,11 +97,44 @@ pub fn paste_text(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// 菜单屏蔽键：与 AHK 的 A_MenuMaskKey（vkFF）一致。
+/// 热键触发时物理 Alt 往往仍按着，目标窗口只看到 Alt 按下（V 被热键吞掉），
+/// 若紧接着注入 Alt 抬起，部分程序会当成“单击 Alt”激活菜单栏、抢走输入焦点，
+/// 导致后续 Ctrl+V 粘不出内容。先注入一个无副作用的按键可打断该判定。
+const VK_MENU_MASK: VIRTUAL_KEY = VIRTUAL_KEY(0xFF);
+
+/// 检查某个虚拟键当前是否被物理按住
+fn is_key_down(vk: VIRTUAL_KEY) -> bool {
+    unsafe { (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0 }
+}
+
+/// 等待用户松开会污染 Ctrl+V 的物理修饰键（Alt/Shift），最多等待 timeout_ms。
+/// 物理按住的 Alt 会随键盘自动重复重新置为按下状态，仅靠注入抬起事件不总是够，
+/// 这是“偶发粘贴无内容”的常见来源之一。
+fn wait_modifiers_released(timeout_ms: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    while is_key_down(VK_MENU)
+        || is_key_down(VK_LMENU)
+        || is_key_down(VK_RMENU)
+        || is_key_down(VK_SHIFT)
+    {
+        if std::time::Instant::now() >= deadline {
+            warn!("等待修饰键释放超时，继续注入粘贴按键");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// 释放所有修饰键（Alt/Ctrl/Shift），对应 AHK 的 NormalizeModifierStateBeforeSend
 pub fn release_all_modifiers() {
     let inputs = [
-        make_key_input(VK_MENU, true),    // Alt up
-        make_key_input(VK_LMENU, true),   // Left Alt up
+        // 先打菜单屏蔽键，再抬 Alt，避免“单击 Alt”激活窗口菜单
+        make_key_input(VK_MENU_MASK, false),
+        make_key_input(VK_MENU_MASK, true),
+        make_key_input(VK_MENU, true),     // Alt up
+        make_key_input(VK_LMENU, true),    // Left Alt up
+        make_key_input(VK_RMENU, true),    // Right Alt (AltGr) up
         make_key_input(VK_CONTROL, true),  // Ctrl up
         make_key_input(VK_SHIFT, true),    // Shift up
     ];
@@ -113,6 +146,9 @@ pub fn release_all_modifiers() {
 
 /// 发送 Ctrl+V 粘贴快捷键（使用 SendInput 替代 keybd_event）
 pub fn send_ctrl_v() -> Result<()> {
+    // 先给用户留出松开热键的时间（Alt+V/Alt+Enter 的 Alt 尚未抬起时，
+    // 注入的 Ctrl+V 会被识别成 Ctrl+Alt+V 而失效）
+    wait_modifiers_released(250);
     release_all_modifiers();
 
     let inputs = [

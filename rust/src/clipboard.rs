@@ -63,7 +63,7 @@ impl ClipboardManager {
         unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32) != 0 }
     }
 
-    pub fn read_file_list_for_paste(&self) -> Option<String> {
+    pub fn read_file_list_for_paste(&self) -> Option<Vec<String>> {
         let paths = self.get_file_paths()?;
         let wsl_paths: Vec<String> = paths
             .iter()
@@ -74,7 +74,7 @@ impl ClipboardManager {
         if wsl_paths.is_empty() {
             None
         } else {
-            Some(wsl_paths.join("\n"))
+            Some(wsl_paths)
         }
     }
 

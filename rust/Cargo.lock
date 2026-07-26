@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "wsl_clipboard"
-version = "2.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "chrono",

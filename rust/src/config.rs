@@ -13,6 +13,11 @@ pub struct AppConfig {
 
     /// 粘贴格式: "plain" (路径), "attachment" (附件)
     pub paste_format: PasteFormat,
+
+    /// 路径粘贴风格: "plain" (纯路径), "at" (@ 前缀), "quoted" (引号包裹)
+    /// 旧版配置文件没有该字段，缺省按 plain 处理
+    #[serde(default)]
+    pub path_style: PathStyle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,12 +34,58 @@ pub enum PasteFormat {
     Attachment,
 }
 
+/// 路径粘贴风格
+/// - Plain: `/mnt/c/...`，Claude Code / Codex / OpenCode 可直接识别为图片
+/// - At: `@/mnt/c/... `，适配 Kimi Code CLI / Gemini CLI / Qwen Code 等 @ 文件引用语法
+/// - Quoted: `"/mnt/c/..."`，用于含空格路径或直接喂给 shell 命令
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PathStyle {
+    #[default]
+    Plain,
+    At,
+    Quoted,
+}
+
+impl PathStyle {
+    /// 将一组 WSL 路径格式化为最终粘贴文本
+    pub fn format_paths(&self, paths: &[String]) -> String {
+        match self {
+            PathStyle::Plain => paths.join("\n"),
+            PathStyle::Quoted => paths
+                .iter()
+                .map(|p| format!("\"{}\"", p))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            // @ 引用需要空格断词：多个路径用空格分隔，并保留尾随空格，
+            // 这样 CLI 能立刻结束文件引用解析，用户也可以直接继续输入
+            PathStyle::At => {
+                let joined = paths
+                    .iter()
+                    .map(|p| format!("@{}", p))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("{} ", joined)
+            }
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            PathStyle::Plain => "纯路径（Claude/Codex/OpenCode）",
+            PathStyle::At => "@ 路径（Kimi/Gemini/Qwen）",
+            PathStyle::Quoted => "引号路径（含空格场景）",
+        }
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             hotkey: "!v".to_string(),
             runtime_mode: RuntimeMode::Fast,
             paste_format: PasteFormat::Plain,
+            path_style: PathStyle::default(),
         }
     }
 }
