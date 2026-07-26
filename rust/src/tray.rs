@@ -1,5 +1,5 @@
 use crate::cleanup;
-use crate::config::{AppConfig, RuntimeMode};
+use crate::config::{AppConfig, PathStyle, RuntimeMode};
 use crate::hotkey::{HotkeyManager, HotkeyType};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -26,12 +26,16 @@ const CMD_MODE_SAFE: u32 = 2001;
 const CMD_MODE_FAST: u32 = 2002;
 const CMD_OPEN_FOLDER: u32 = 3001;
 const CMD_EXIT: u32 = 4001;
+const CMD_STYLE_PLAIN: u32 = 5001;
+const CMD_STYLE_AT: u32 = 5002;
+const CMD_STYLE_QUOTED: u32 = 5003;
 
 /// 托盘发往主循环的命令
 #[derive(Debug, Clone)]
 pub enum TrayCommand {
     SwitchHotkey(HotkeyType),
     SwitchMode(RuntimeMode),
+    SwitchPathStyle(PathStyle),
     OpenFolder,
     Exit,
 }
@@ -318,6 +322,31 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let mode_label: Vec<u16> = "运行模式\0".encode_utf16().collect();
     let _ = AppendMenuW(h_menu, MF_POPUP, h_mode_menu.0 as usize, PCWSTR::from_raw(mode_label.as_ptr()));
 
+    // ---- 路径格式子菜单 ----
+    let h_style_menu = match CreatePopupMenu() {
+        Ok(m) => m,
+        Err(_) => { let _ = DestroyMenu(h_menu); return; }
+    };
+
+    let current_style = state.config.path_style;
+    let style_items = [
+        (PathStyle::Plain, CMD_STYLE_PLAIN),
+        (PathStyle::At, CMD_STYLE_AT),
+        (PathStyle::Quoted, CMD_STYLE_QUOTED),
+    ];
+    for (style, cmd_id) in style_items {
+        let label = format!("{}\0", style.display_name());
+        let label_w: Vec<u16> = label.encode_utf16().collect();
+        let mut flags = MF_STRING;
+        if style == current_style {
+            flags |= MF_CHECKED;
+        }
+        let _ = AppendMenuW(h_style_menu, flags, cmd_id as usize, PCWSTR::from_raw(label_w.as_ptr()));
+    }
+
+    let style_label: Vec<u16> = "路径格式\0".encode_utf16().collect();
+    let _ = AppendMenuW(h_menu, MF_POPUP, h_style_menu.0 as usize, PCWSTR::from_raw(style_label.as_ptr()));
+
     // ---- 分隔线 ----
     let _ = AppendMenuW(h_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
@@ -355,6 +384,9 @@ unsafe fn handle_menu_command(cmd_id: u32) {
         CMD_HOTKEY_ALTENTER => switch_hotkey(state, HotkeyType::AltEnter),
         CMD_MODE_SAFE => switch_mode(state, RuntimeMode::Safe),
         CMD_MODE_FAST => switch_mode(state, RuntimeMode::Fast),
+        CMD_STYLE_PLAIN => switch_path_style(state, PathStyle::Plain),
+        CMD_STYLE_AT => switch_path_style(state, PathStyle::At),
+        CMD_STYLE_QUOTED => switch_path_style(state, PathStyle::Quoted),
         CMD_OPEN_FOLDER => {
             let _ = state.cmd_tx.send(TrayCommand::OpenFolder);
         }
@@ -387,6 +419,19 @@ unsafe fn switch_hotkey(state: &mut TrayState, hotkey_type: HotkeyType) {
 
     let _ = state.cmd_tx.send(TrayCommand::SwitchHotkey(hotkey_type));
     info!("已切换热键: {}", hotkey_type.display_name());
+}
+
+/// 切换路径格式
+unsafe fn switch_path_style(state: &mut TrayState, style: PathStyle) {
+    if state.config.path_style == style {
+        return;
+    }
+
+    state.config.path_style = style;
+    let _ = state.config.save();
+
+    let _ = state.cmd_tx.send(TrayCommand::SwitchPathStyle(style));
+    info!("已切换路径格式: {}", style.display_name());
 }
 
 /// 切换模式

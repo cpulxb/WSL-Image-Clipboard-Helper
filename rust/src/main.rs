@@ -1,7 +1,6 @@
 #![windows_subsystem = "windows"]
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
@@ -15,13 +14,14 @@ mod paste;
 mod tray;
 
 use clipboard::ClipboardManager;
-use config::RuntimeMode;
+use config::{PathStyle, RuntimeMode};
 use paste::HKL;
 use tray::TrayCommand;
 
 /// 应用运行时状态（可被托盘命令修改）
 struct AppState {
     runtime_mode: RuntimeMode,
+    path_style: PathStyle,
 }
 
 #[tokio::main]
@@ -30,7 +30,10 @@ async fn main() -> Result<()> {
         .with_max_level(tracing::Level::INFO)
         .init();
 
-    info!("WSL Clipboard Helper v2.0.0 (Rust) 启动中...");
+    info!(
+        "WSL Clipboard Helper v{} (Rust) 启动中...",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // 加载配置
     let app_config = config::AppConfig::load().unwrap_or_default();
@@ -55,12 +58,10 @@ async fn main() -> Result<()> {
     // 创建剪贴板管理器
     let clipboard_manager = ClipboardManager::new(temp_dir.clone());
 
-    // 启动图片保存异步任务（不再需要 temp_dir 参数）
-    let save_tx = image_saver::start_saver();
-
     // 运行时状态
     let state = Arc::new(Mutex::new(AppState {
         runtime_mode: app_config.runtime_mode.clone(),
+        path_style: app_config.path_style,
     }));
 
     // 启动托盘（含热键管理器）
@@ -103,11 +104,11 @@ async fn main() -> Result<()> {
         tokio::select! {
             // 热键触发
             Some(_hotkey_id) = hotkey_rx.recv() => {
-                let mode = {
+                let (mode, path_style) = {
                     let s = state.lock().await;
-                    s.runtime_mode.clone()
+                    (s.runtime_mode.clone(), s.path_style)
                 };
-                match handle_paste(&clipboard_manager, &save_tx, &mode, english_hkl).await {
+                match handle_paste(&clipboard_manager, &mode, path_style, english_hkl).await {
                     Ok(_) => {}
                     Err(e) => {
                         error!("粘贴处理失败: {}", e);
@@ -124,6 +125,11 @@ async fn main() -> Result<()> {
                         info!("主循环: 模式已切换为 {:?}", mode);
                         let mut s = state.lock().await;
                         s.runtime_mode = mode;
+                    }
+                    TrayCommand::SwitchPathStyle(style) => {
+                        info!("主循环: 路径格式已切换为 {}", style.display_name());
+                        let mut s = state.lock().await;
+                        s.path_style = style;
                     }
                     TrayCommand::OpenFolder => {
                         if let Err(e) = tray::open_temp_folder() {
@@ -155,27 +161,28 @@ async fn main() -> Result<()> {
 /// 处理粘贴操作
 async fn handle_paste(
     clipboard_manager: &ClipboardManager,
-    save_tx: &mpsc::Sender<(PathBuf, Vec<u8>)>,
     mode: &RuntimeMode,
+    path_style: PathStyle,
     english_hkl: HKL,
 ) -> Result<()> {
     // 1. 检查剪贴板是否有图片
     if !clipboard_manager.has_image() {
         if clipboard_manager.has_file_list() {
             if let Some(wsl_paths) = clipboard_manager.read_file_list_for_paste() {
+                let paste_text = path_style.format_paths(&wsl_paths);
+
                 let _ime_guard = match mode {
                     RuntimeMode::Safe => Some(paste::ImeGuard::new(english_hkl)?),
                     RuntimeMode::Fast => None,
                 };
 
-                info!("粘贴文件路径: {}", wsl_paths);
-                paste::paste_text(&wsl_paths)?;
+                info!("粘贴文件路径: {}", paste_text);
+                paste::paste_text(&paste_text)?;
                 return Ok(());
             }
         }
 
         info!("剪贴板无图片，执行普通粘贴");
-        paste::release_all_modifiers();
         paste::send_ctrl_v()?;
         return Ok(());
     }
@@ -187,19 +194,21 @@ async fn handle_paste(
         .read_image_for_paste()
         .ok_or_else(|| anyhow::anyhow!("读取剪贴板图片失败"))?;
 
-    // 3. 输入法保护（仅安全模式）
+    // 3. 先落盘再粘贴：CLI 收到路径的瞬间会检查文件是否存在，
+    //    决定渲染成 [Image #n] 还是留下原始路径文本（issue #4）
+    info!("保存图片: {} bytes → {}", png_data.len(), win_path.display());
+    image_saver::ensure_saved(&win_path, &png_data).await?;
+
+    // 4. 输入法保护（仅安全模式）
     let _ime_guard = match mode {
         RuntimeMode::Safe => Some(paste::ImeGuard::new(english_hkl)?),
         RuntimeMode::Fast => None,
     };
 
-    // 4. 粘贴 WSL 路径
-    info!("粘贴路径: {}", wsl_path);
-    paste::paste_text(&wsl_path)?;
-
-    // 5. 异步保存图片
-    info!("保存图片: {} bytes → {}", png_data.len(), win_path.display());
-    let _ = save_tx.send((win_path, png_data)).await;
+    // 5. 粘贴 WSL 路径
+    let paste_text = path_style.format_paths(std::slice::from_ref(&wsl_path));
+    info!("粘贴路径: {}", paste_text);
+    paste::paste_text(&paste_text)?;
 
     // 6. ImeGuard 在此处 drop，触发 120ms 后恢复输入法
 
