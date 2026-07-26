@@ -7,10 +7,11 @@ use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    VIRTUAL_KEY, VK_CONTROL, VK_LMENU, VK_MENU, VK_RMENU, VK_SHIFT, VK_V,
+    VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_LMENU, VK_MENU, VK_RMENU, VK_SHIFT, VK_V,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowThreadProcessId, PostMessageW,
+    GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, PostMessageW, GUITHREADINFO,
+    GUI_INMENUMODE,
 };
 
 use tracing::{info, warn};
@@ -126,6 +127,53 @@ fn wait_modifiers_released(timeout_ms: u64) {
     }
 }
 
+/// 热键触发后应立即调用：抢在用户松开 Alt 之前插入屏蔽键。
+/// RegisterHotKey 会吞掉 V 键事件，目标窗口只看到 Alt 按下/抬起；
+/// 若屏蔽键能落在物理 Alt 抬起之前，窗口就不会把它当成"单击 Alt"而激活菜单栏。
+/// 必须放在读剪贴板/写文件等耗时操作之前，越早越好。
+pub fn mask_alt_tap() {
+    let inputs = [
+        make_key_input(VK_MENU_MASK, false),
+        make_key_input(VK_MENU_MASK, true),
+    ];
+    unsafe {
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// 若前台线程已进入菜单模式（快速松开 Alt 时屏蔽键会输掉竞速，菜单栏已被激活），
+/// 先发送 Esc 退出菜单，否则注入的 Ctrl+V 会被菜单吃掉、粘贴无效
+fn dismiss_menu_mode_if_active() {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0 == 0 {
+            return;
+        }
+        let thread_id = GetWindowThreadProcessId(hwnd, None);
+        if thread_id == 0 {
+            return;
+        }
+
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(thread_id, &mut info).is_err() {
+            return;
+        }
+
+        if (info.flags & GUI_INMENUMODE).0 != 0 {
+            info!("前台窗口处于菜单模式，先发送 Esc 退出再粘贴");
+            let esc = [
+                make_key_input(VK_ESCAPE, false),
+                make_key_input(VK_ESCAPE, true),
+            ];
+            SendInput(&esc, std::mem::size_of::<INPUT>() as i32);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+    }
+}
+
 /// 释放所有修饰键（Alt/Ctrl/Shift），对应 AHK 的 NormalizeModifierStateBeforeSend
 pub fn release_all_modifiers() {
     let inputs = [
@@ -150,6 +198,8 @@ pub fn send_ctrl_v() -> Result<()> {
     // 注入的 Ctrl+V 会被识别成 Ctrl+Alt+V 而失效）
     wait_modifiers_released(250);
     release_all_modifiers();
+    // Alt 已被松开且菜单栏被激活时，Ctrl+V 会发进菜单而不是输入框
+    dismiss_menu_mode_if_active();
 
     let inputs = [
         make_key_input(VK_CONTROL, false), // Ctrl down
