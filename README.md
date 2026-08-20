@@ -40,7 +40,7 @@
 
 - 🚀 即时路径输出：触发热键后优先粘贴 `/mnt/...` 路径，减少等待时间
 - ⚡ 图片异步保存：路径先可用，图片文件后台写入，降低主流程阻塞
-- 🌐 输入法保护（安全模式）：粘贴前切英文输入法，结束后自动恢复
+- 🌐 输入法保护（兼容模式）：粘贴前把前台窗口切到直接输入英文，结束后自动恢复；默认不改动系统键盘布局，可在托盘彻底关闭
 - 🧹 自动清理机制：周期清理过期 PNG，退出时清理临时图片
 - 🖱️ 托盘管理：支持切换热键、切换运行模式、打开临时图片目录、退出并清理临时图片
 - 🛡️ 图片读取边界保护：对 DIB 头与内存大小做安全校验，避免异常数据导致崩溃
@@ -132,8 +132,24 @@ WSL-Image-Clipboard-Helper/
 - 运行配置保存在 `wsl_clipboard.toml`（与可执行文件同目录）
 - 托盘菜单中的 `退出并清理临时图片` 会删除 `temp/` 下的临时 PNG 文件
 - 若遇到输入法导致的粘贴错乱，切回 `兼容模式（输入法保护）`
+- 不希望本工具碰输入法，可在托盘 `输入法保护` 中选择 `关闭（不干预输入法）`
 - 若托盘图标未显示，请检查任务栏隐藏图标区域
 - 默认粘贴纯路径；Kimi 等需要 `@` 文件引用的 CLI，请在托盘菜单切换 `路径格式`
+
+### ⌨️ 输入法保护策略
+
+仅在 `运行模式 = 兼容模式` 时生效，可在托盘 `输入法保护` 子菜单切换，或直接改 `wsl_clipboard.toml` 的 `ime_protection`：
+
+| 取值 | 行为 | 是否会改动系统输入法列表 |
+| --- | --- | --- |
+| `off` | 完全不干预输入法 | 否 |
+| `imm`（默认） | 仅关闭前台窗口的 IME 输入状态（切到直接输入），粘贴后恢复 | 否 |
+| `layout` | 切换到英文键盘布局，但**只复用**系统里已安装的英文布局；没有就跳过 | 否 |
+| `layout-force` | 找不到英文布局时才加载 `ENG`（不激活），并在退出时自动卸载 | 仅此项可能临时新增 |
+
+> 自 v4.1.3 起，程序**不再于启动时预加载英文键盘布局**。旧版本会在启动瞬间无条件调用
+> `LoadKeyboardLayoutW("00000409", KLF_ACTIVATE)`，把英文布局登记进系统输入法列表，
+> 导致 `Win + Space` 里凭空多出 `ENG / English (United States)`（[issue #10](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/10)）。
 
 ### ❓ 常见问题（FAQ）
 
@@ -161,6 +177,20 @@ Kimi Code CLI 不会把纯文本路径自动识别为图片，但支持 `@文件
 **Q4：路径里有空格，粘贴后被命令行截断？**
 
 把 `路径格式` 切换为 `引号路径`，粘贴时会用双引号包裹每个路径。
+
+**Q5：启动本工具后，`Win + Space` 里多出了 `ENG / English (United States)`？**（[issue #10](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/10)）
+
+v4.1.2 及更早版本在启动时就无条件执行 `LoadKeyboardLayoutW("00000409", KLF_ACTIVATE)` 预加载英文布局。`LoadKeyboardLayoutW` 会把该布局登记进**系统**的输入法列表，`KLF_ACTIVATE` 还会立即激活它，于是即使你的语言列表里从没添加过英语，工具一启动就会多出 `ENG`，任务栏输入法图标也被重新唤出。
+
+v4.1.3 起：
+
+- 启动阶段不再做任何键盘布局操作
+- 英文布局改为**惰性解析**，且默认只在系统已装的布局里复用，绝不擅自新增
+- 默认策略换成 `imm`：只关闭前台窗口的 IME 输入状态，完全不触碰键盘布局
+- 确需加载时（`ime_protection = "layout-force"`）不再使用 `KLF_ACTIVATE`，并改用 `KLF_NOTELLSHELL` 避免唤出任务栏指示器，退出时自动 `UnloadKeyboardLayout`
+- 新增 `ime_protection = "off"`，可彻底关闭输入法保护
+
+如果你此前被旧版本影响，系统语言列表里已经留下了英语（美国），需要到 `设置 → 时间和语言 → 语言和区域` 手动删除一次；新版本不会再添加它。
 
 ### 🛠️ Rust 版本编译（推荐）
 
@@ -216,7 +246,14 @@ rustup target add x86_64-pc-windows-msvc
 
 ### 🕒 版本历史
 
-#### v4.1.2（当前版本，Rust） ✅
+#### v4.1.3（当前版本，Rust） ✅
+
+- 修复启动后系统输入法列表凭空多出 `ENG / English (United States)` 的问题：不再于启动时无条件调用 `LoadKeyboardLayoutW("00000409", KLF_ACTIVATE)`（#10）
+- 英文布局改为惰性解析，默认只复用系统已装布局；确需加载时不再使用 `KLF_ACTIVATE`，并在退出时自动卸载
+- 新增 `输入法保护` 托盘选项与 `ime_protection` 配置项：`off` / `imm`（新默认，零副作用）/ `layout` / `layout-force`
+- 与前台窗口 IME 的通信改用带超时的 `SendMessageTimeoutW`，避免无响应窗口拖住粘贴路径
+
+#### v4.1.2（Rust） ✅
 
 - 修复快速松开 Alt 时粘贴被目标窗口菜单栏吃掉的问题：热键触发后立即注入屏蔽键，若前台已进入菜单模式则先发 Esc 退出再粘贴（#2）
 
@@ -280,7 +317,7 @@ Current mainline release is Rust-based (`v4.0`). The recommended path is to down
 
 - 🚀 Fast path-first paste workflow
 - ⚡ Async image persistence
-- 🌐 IME guard in safe mode
+- 🌐 IME guard in compatibility mode — closes the foreground IME before pasting and restores it afterwards, without altering system keyboard layouts (switchable, and fully disableable)
 - 🖱️ Tray-based hotkey and mode switching
 - 🧹 Automatic cleanup for temporary PNG files
 - 🛡️ Safer clipboard parsing with memory-bound checks
@@ -349,8 +386,20 @@ WSL-Image-Clipboard-Helper/
 - Runtime settings are stored in `wsl_clipboard.toml` next to the executable.
 - `Exit and clean temporary images` removes temporary PNG files under `temp/`.
 - If IME state causes paste issues, switch back to `Compatibility mode (IME guard)`.
+- To stop the helper from touching your IME at all, pick `关闭（不干预输入法）` under the tray `输入法保护` (IME guard) submenu.
 - If the tray icon is not visible, check the hidden icons area in the Windows taskbar.
 - Plain paths are pasted by default; for CLIs that need `@` file references (e.g. Kimi Code CLI), switch `路径格式` (path style) in the tray menu.
+
+### ⌨️ IME guard strategies
+
+Effective only in compatibility mode. Switch it in the tray `输入法保护` submenu, or set `ime_protection` in `wsl_clipboard.toml`:
+
+| Value | Behaviour | Touches the system IME list? |
+| --- | --- | --- |
+| `off` | Never touches the IME | No |
+| `imm` (default) | Only closes the foreground window's IME open status, restoring it after the paste | No |
+| `layout` | Switches to an English keyboard layout, but **only reuses** one already installed; skips otherwise | No |
+| `layout-force` | Loads `ENG` on demand (without activating it) and unloads it on exit | Only this one, temporarily |
 
 ### ❓ FAQ
 
@@ -369,6 +418,14 @@ Kimi Code CLI does not auto-detect plain path text, but it supports `@file` refe
 **Q4: Paths containing spaces get cut off in the shell.**
 
 Switch the path style to the quoted option; every path is then wrapped in double quotes.
+
+**Q5: After launching the helper, an extra `ENG / English (United States)` shows up in `Win + Space`.** ([issue #10](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/10))
+
+Up to v4.1.2 the helper called `LoadKeyboardLayoutW("00000409", KLF_ACTIVATE)` unconditionally **at startup**. `LoadKeyboardLayoutW` registers the layout with the **system** input list and `KLF_ACTIVATE` activates it right away, so `ENG` appeared — and the taskbar IME indicator came back — even for users who never added English to their language list.
+
+Since v4.1.3 the helper performs no keyboard-layout work at startup, resolves the English layout lazily, and by default only reuses layouts the system already has. The new default strategy `imm` never touches keyboard layouts at all; `layout-force` no longer uses `KLF_ACTIVATE`, passes `KLF_NOTELLSHELL`, and calls `UnloadKeyboardLayout` on exit. Set `ime_protection = "off"` to disable the guard entirely.
+
+If an earlier version already left English (United States) in your language list, remove it once under `Settings → Time & language → Language & region`; the new build will not add it back.
 
 If you prefer building from source:
 
@@ -402,6 +459,7 @@ cargo clean
 
 ### 🕒 Version Line
 
+- `v4.1.3`: no more phantom `ENG` keyboard layout on startup — lazy English-layout resolution plus the new `ime_protection` setting (#10)
 - `v4.1.2`: dismiss the target window's menu mode (fast Alt release) before injecting Ctrl+V so pastes are not swallowed
 - `v4.1.1`: treat all-zero alpha in 32-bit clipboard DIBs as opaque so saved PNGs are not fully transparent
 - `v4.1`: save-before-paste ordering fix (#4), switchable path style incl. `@` references for Kimi/Gemini/Qwen (#5), hardened key injection (#2)

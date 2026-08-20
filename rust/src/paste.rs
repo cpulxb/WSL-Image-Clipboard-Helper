@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -16,26 +17,172 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use tracing::{info, warn};
 
+use crate::config::ImeProtection;
+
 /// HKL 类型别名（Win32 HKL 就是一个 isize）
 pub type HKL = isize;
 
 /// WM_INPUTLANGCHANGEREQUEST
 const WM_INPUTLANGCHANGEREQUEST: u32 = 0x0050;
 
-/// 预加载英文输入法布局，返回英文 HKL
-/// 启动时调用一次即可
-pub fn preload_english_layout() -> HKL {
-    unsafe {
-        let layout_str: Vec<u16> = "00000409\0".encode_utf16().collect();
-        // KLF_ACTIVATE (0x1): 加载并激活英文布局，确保可用（与 AHK 一致）
-        LoadKeyboardLayoutW(layout_str.as_ptr(), 0x01)
-    }
-}
+/// WM_IME_CONTROL 及其子命令，用于在**不改动键盘布局**的前提下
+/// 关闭 / 恢复前台窗口的 IME 输入状态
+const WM_IME_CONTROL: u32 = 0x0283;
+const IMC_GETOPENSTATUS: usize = 0x0005;
+const IMC_SETOPENSTATUS: usize = 0x0006;
+
+/// LoadKeyboardLayoutW 的标志位。
+///
+/// 这里**故意不使用 KLF_ACTIVATE (0x1)**：它会把英文布局激活到当前线程，
+/// 而 LoadKeyboardLayoutW 本身就已经把布局登记进系统输入法列表了，
+/// 两者叠加就是 issue #10 里"启动后 Win+Space 多出 ENG"的直接原因。
+/// KLF_NOTELLSHELL (0x80) 则可以阻止 Shell 收到 HSHELL_LANGUAGE 通知，
+/// 避免任务栏输入法指示器被重新唤出来。
+const KLF_NOTELLSHELL: u32 = 0x0080;
+
+/// SendMessageTimeout 标志：目标线程挂死时立刻返回，不要把热键线程拖住
+const SMTO_ABORTIFHUNG: u32 = 0x0002;
+/// 与前台窗口 IME 通信的超时（毫秒）。粘贴路径对延迟敏感，宁可放弃保护也不能卡住。
+const IME_CONTROL_TIMEOUT_MS: u32 = 80;
+
+/// 英语主语言 ID（LANG_ENGLISH）
+const LANG_ENGLISH: u16 = 0x09;
+/// en-US 完整语言 ID
+const LANGID_EN_US: u16 = 0x0409;
+
+/// 本进程通过 LoadKeyboardLayoutW 主动加载的英文布局。
+/// 0 表示从未主动加载过。退出时据此卸载，避免在用户的系统输入法列表里留下 ENG。
+static SELF_LOADED_ENGLISH_HKL: AtomicIsize = AtomicIsize::new(0);
 
 #[link(name = "user32")]
 extern "system" {
     fn LoadKeyboardLayoutW(pwszklid: *const u16, flags: u32) -> HKL;
-    fn GetKeyboardLayout(idThread: u32) -> HKL;
+    fn UnloadKeyboardLayout(hkl: HKL) -> i32;
+    fn GetKeyboardLayout(id_thread: u32) -> HKL;
+    fn GetKeyboardLayoutList(n_buff: i32, lp_list: *mut HKL) -> i32;
+    fn SendMessageTimeoutW(
+        hwnd: isize,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+        flags: u32,
+        timeout: u32,
+        result: *mut usize,
+    ) -> isize;
+}
+
+#[link(name = "imm32")]
+extern "system" {
+    fn ImmGetDefaultIMEWnd(hwnd: isize) -> isize;
+}
+
+/// 取 HKL 低 16 位的输入语言 ID（高 16 位是设备句柄）
+fn langid_of(hkl: HKL) -> u16 {
+    (hkl as usize & 0xFFFF) as u16
+}
+
+/// 取主语言 ID（LANGID 的低 10 位）
+fn primary_lang_of(hkl: HKL) -> u16 {
+    langid_of(hkl) & 0x3FF
+}
+
+/// 在系统**已加载**的键盘布局里查找英文布局。
+/// 纯查询，不会向系统新增任何布局，因此没有任何副作用。
+fn find_loaded_english_layout() -> Option<HKL> {
+    unsafe {
+        let count = GetKeyboardLayoutList(0, std::ptr::null_mut());
+        if count <= 0 {
+            return None;
+        }
+
+        let mut list: Vec<HKL> = vec![0; count as usize];
+        let filled = GetKeyboardLayoutList(count, list.as_mut_ptr());
+        if filled <= 0 {
+            return None;
+        }
+        list.truncate(filled as usize);
+
+        // 优先精确匹配 en-US，其次退回任意英文变体（en-GB 等同样是纯字母布局）
+        list.iter()
+            .copied()
+            .find(|hkl| langid_of(*hkl) == LANGID_EN_US)
+            .or_else(|| {
+                list.iter()
+                    .copied()
+                    .find(|hkl| primary_lang_of(*hkl) == LANG_ENGLISH)
+            })
+    }
+}
+
+/// 惰性获取英文布局 HKL。
+///
+/// 与旧实现的关键区别：**不在启动时调用**，且默认只复用系统已有的布局。
+/// 只有 `allow_load = true`（`ime_protection = "layout-force"`）时才真正加载，
+/// 且不带 KLF_ACTIVATE，退出时会由 [`unload_self_loaded_layout`] 卸载。
+fn resolve_english_layout(allow_load: bool) -> Option<HKL> {
+    // 1) 复用系统里已经装好的英文布局（绝大多数英文/多语言用户走这条路）
+    if let Some(hkl) = find_loaded_english_layout() {
+        return Some(hkl);
+    }
+
+    // 2) 用户没装英文布局：默认放弃切换，绝不擅自往系统里塞一个 ENG
+    if !allow_load {
+        return None;
+    }
+
+    // 3) 显式允许时才加载，并且只加载一次
+    let cached = SELF_LOADED_ENGLISH_HKL.load(Ordering::Relaxed);
+    if cached != 0 {
+        return Some(cached);
+    }
+
+    unsafe {
+        let klid: Vec<u16> = "00000409\0".encode_utf16().collect();
+        let hkl = LoadKeyboardLayoutW(klid.as_ptr(), KLF_NOTELLSHELL);
+        if hkl == 0 {
+            warn!("加载英文键盘布局失败，跳过输入法保护");
+            return None;
+        }
+        info!("已惰性加载英文键盘布局 {:#x}（退出时会卸载）", hkl);
+        SELF_LOADED_ENGLISH_HKL.store(hkl, Ordering::Relaxed);
+        Some(hkl)
+    }
+}
+
+/// 退出时卸载本进程主动加载过的英文布局，
+/// 保证不会在用户的输入法切换列表里留下残留（issue #10）。
+pub fn unload_self_loaded_layout() {
+    let hkl = SELF_LOADED_ENGLISH_HKL.swap(0, Ordering::Relaxed);
+    if hkl == 0 {
+        return;
+    }
+    unsafe {
+        if UnloadKeyboardLayout(hkl) == 0 {
+            warn!("卸载英文键盘布局 {:#x} 失败", hkl);
+        } else {
+            info!("已卸载本进程加载的英文键盘布局 {:#x}", hkl);
+        }
+    }
+}
+
+/// 向前台窗口的默认 IME 窗口发送 WM_IME_CONTROL。
+/// 使用带超时的 SendMessageTimeoutW，避免目标进程无响应时卡住粘贴。
+unsafe fn send_ime_control(ime_wnd: isize, sub_command: usize, lparam: isize) -> Option<usize> {
+    let mut result: usize = 0;
+    let ok = SendMessageTimeoutW(
+        ime_wnd,
+        WM_IME_CONTROL,
+        sub_command,
+        lparam,
+        SMTO_ABORTIFHUNG,
+        IME_CONTROL_TIMEOUT_MS,
+        &mut result,
+    );
+    if ok == 0 {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 /// 粘贴文本到剪贴板并执行粘贴操作
@@ -239,84 +386,175 @@ fn make_key_input(vk: VIRTUAL_KEY, key_up: bool) -> INPUT {
     }
 }
 
+/// 恢复动作的延迟（毫秒）：必须晚于注入的 Ctrl+V 被目标窗口真正处理的时刻，
+/// 否则输入法会在粘贴完成前就被切回去。
+const RESTORE_DELAY_MS: u64 = 120;
+
+/// [`ImeGuard`] 在析构时需要撤销的动作。
+/// 只有真正改动过状态才会记录，"什么都没做"就绝不会去恢复。
+enum ImeRestore {
+    /// 未做任何改动，无需恢复
+    Nothing,
+    /// 需要把键盘布局切回原值
+    Layout { hwnd: HWND, previous_hkl: HKL },
+    /// 需要把 IME 输入状态重新打开
+    OpenStatus { ime_wnd: isize },
+}
+
 /// 输入法保护器
-/// 在粘贴路径前切换到英文输入法，完成后异步恢复
+///
+/// 在粘贴前把前台窗口置为"直接输入英文"的状态，粘贴完成后异步恢复。
+/// 具体手段由 [`ImeProtection`] 策略决定，详见该枚举的说明与 issue #10。
+///
+/// 设计原则：输入法保护是**尽力而为**的辅助措施。任何一步失败都安静降级成
+/// "不保护"，绝不让输入法问题导致粘贴本身失败，也绝不擅自改动系统输入法列表。
 pub struct ImeGuard {
-    /// 切换前的键盘布局句柄
-    previous_hkl: HKL,
-    /// 前台窗口句柄
-    hwnd: HWND,
+    restore: ImeRestore,
 }
 
 impl ImeGuard {
-    /// 创建新的输入法保护器
-    /// 获取当前输入法布局，切换到英文，保存旧布局用于恢复
-    pub fn new(english_hkl: HKL) -> Result<Self> {
+    /// 按给定策略保护输入法状态
+    pub fn new(policy: ImeProtection) -> Self {
+        let restore = match policy {
+            ImeProtection::Off => ImeRestore::Nothing,
+            ImeProtection::Imm => Self::close_ime_open_status(),
+            ImeProtection::Layout | ImeProtection::LayoutForce => {
+                Self::switch_to_english_layout(policy.allows_loading_layout())
+            }
+        };
+
+        Self { restore }
+    }
+
+    /// 关闭前台窗口的 IME 输入状态（即切到直接输入 / 英文模式）。
+    ///
+    /// 这是默认策略：只和目标窗口的 IME 窗口通信，**完全不触碰键盘布局**，
+    /// 因此不会像旧实现那样在系统输入法列表里新增 `ENG`（issue #10）。
+    fn close_ime_open_status() -> ImeRestore {
         unsafe {
             let hwnd = GetForegroundWindow();
             if hwnd.0 == 0 {
-                // 无前台窗口，跳过输入法切换
-                return Ok(Self {
-                    previous_hkl: 0,
-                    hwnd: HWND::default(),
-                });
+                return ImeRestore::Nothing;
+            }
+
+            let ime_wnd = ImmGetDefaultIMEWnd(hwnd.0);
+            if ime_wnd == 0 {
+                // 前台窗口没有关联 IME 窗口（纯英文环境常见），无需保护
+                return ImeRestore::Nothing;
+            }
+
+            // 已经处于关闭（直接输入）状态时不做任何改动，也就不需要恢复
+            match send_ime_control(ime_wnd, IMC_GETOPENSTATUS, 0) {
+                Some(0) => return ImeRestore::Nothing,
+                None => {
+                    warn!("ImeGuard: 查询 IME 输入状态超时，跳过输入法保护");
+                    return ImeRestore::Nothing;
+                }
+                Some(_) => {}
+            }
+
+            if send_ime_control(ime_wnd, IMC_SETOPENSTATUS, 0).is_none() {
+                warn!("ImeGuard: 关闭 IME 输入状态超时，跳过输入法保护");
+                return ImeRestore::Nothing;
+            }
+
+            info!("ImeGuard: 已关闭前台窗口 IME 输入状态");
+            ImeRestore::OpenStatus { ime_wnd }
+        }
+    }
+
+    /// 切换到英文键盘布局（兼容旧行为）。
+    ///
+    /// `allow_load` 为 false 时只复用系统里已经装好的英文布局，
+    /// 找不到就直接放弃，绝不调用 LoadKeyboardLayoutW 往系统里新增布局。
+    fn switch_to_english_layout(allow_load: bool) -> ImeRestore {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.0 == 0 {
+                return ImeRestore::Nothing;
             }
 
             let thread_id = GetWindowThreadProcessId(hwnd, None);
             if thread_id == 0 {
-                return Ok(Self {
-                    previous_hkl: 0,
-                    hwnd: HWND::default(),
-                });
+                return ImeRestore::Nothing;
             }
 
             let current_hkl = GetKeyboardLayout(thread_id);
 
-            // 仅在当前布局不是英文时才切换
-            if english_hkl != 0 && current_hkl != english_hkl {
-                info!("ImeGuard: 切换输入法 {:#x} -> {:#x}", current_hkl, english_hkl);
-                let _ = PostMessageW(
-                    hwnd,
-                    WM_INPUTLANGCHANGEREQUEST,
-                    WPARAM(0),
-                    LPARAM(english_hkl),
-                );
-                std::thread::sleep(std::time::Duration::from_millis(60));
+            // 当前已经是英文布局，无需切换
+            if primary_lang_of(current_hkl) == LANG_ENGLISH {
+                return ImeRestore::Nothing;
             }
 
-            Ok(Self {
-                previous_hkl: current_hkl,
+            let english_hkl = match resolve_english_layout(allow_load) {
+                Some(hkl) => hkl,
+                None => {
+                    info!("ImeGuard: 系统未加载英文键盘布局，跳过切换（不会擅自添加 ENG）");
+                    return ImeRestore::Nothing;
+                }
+            };
+
+            if current_hkl == english_hkl {
+                return ImeRestore::Nothing;
+            }
+
+            info!(
+                "ImeGuard: 切换输入法 {:#x} -> {:#x}",
+                current_hkl, english_hkl
+            );
+            let _ = PostMessageW(
                 hwnd,
-            })
+                WM_INPUTLANGCHANGEREQUEST,
+                WPARAM(0),
+                LPARAM(english_hkl),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(60));
+
+            ImeRestore::Layout {
+                hwnd,
+                previous_hkl: current_hkl,
+            }
         }
     }
 }
 
 impl Drop for ImeGuard {
-    /// 析构时异步恢复之前的键盘布局
+    /// 析构时在后台线程延迟恢复，既不阻塞热键线程，
+    /// 也保证恢复发生在注入的 Ctrl+V 被目标窗口处理之后
     fn drop(&mut self) {
-        if self.previous_hkl == 0 || self.hwnd.0 == 0 {
-            return;
-        }
+        match std::mem::replace(&mut self.restore, ImeRestore::Nothing) {
+            ImeRestore::Nothing => {}
 
-        let hkl = self.previous_hkl;
-        let hwnd = self.hwnd;
-
-        // 在后台线程中延迟恢复，不阻塞主线程
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(120));
-            unsafe {
-                if let Err(e) = PostMessageW(
-                    hwnd,
-                    WM_INPUTLANGCHANGEREQUEST,
-                    WPARAM(0),
-                    LPARAM(hkl),
-                ) {
-                    warn!("恢复输入法失败: {:?}", e);
-                } else {
-                    info!("ImeGuard: 已恢复输入法 {:#x}", hkl);
-                }
+            ImeRestore::Layout { hwnd, previous_hkl } => {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(RESTORE_DELAY_MS));
+                    unsafe {
+                        if let Err(e) = PostMessageW(
+                            hwnd,
+                            WM_INPUTLANGCHANGEREQUEST,
+                            WPARAM(0),
+                            LPARAM(previous_hkl),
+                        ) {
+                            warn!("恢复输入法失败: {:?}", e);
+                        } else {
+                            info!("ImeGuard: 已恢复输入法 {:#x}", previous_hkl);
+                        }
+                    }
+                });
             }
-        });
+
+            ImeRestore::OpenStatus { ime_wnd } => {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(RESTORE_DELAY_MS));
+                    unsafe {
+                        if send_ime_control(ime_wnd, IMC_SETOPENSTATUS, 1).is_none() {
+                            warn!("恢复 IME 输入状态超时");
+                        } else {
+                            info!("ImeGuard: 已恢复 IME 输入状态");
+                        }
+                    }
+                });
+            }
+        }
     }
 }

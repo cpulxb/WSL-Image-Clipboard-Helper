@@ -18,6 +18,11 @@ pub struct AppConfig {
     /// 旧版配置文件没有该字段，缺省按 plain 处理
     #[serde(default)]
     pub path_style: PathStyle,
+
+    /// 输入法保护策略（仅在 runtime_mode = "safe" 时生效）
+    /// 旧版配置文件没有该字段，缺省按 imm 处理
+    #[serde(default)]
+    pub ime_protection: ImeProtection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +84,67 @@ impl PathStyle {
     }
 }
 
+/// 输入法保护策略（issue #10）
+///
+/// 背景：早期版本在**启动时**就无条件调用 `LoadKeyboardLayoutW("00000409", KLF_ACTIVATE)`
+/// 预加载英文布局。`LoadKeyboardLayoutW` 会把该布局登记进**系统**的输入法列表，
+/// 于是只要本工具一启动，`Win + Space` 里就会凭空多出
+/// `ENG / English (United States)`，任务栏输入法图标也会重新出现——
+/// 即使用户的语言列表里根本没有添加过英语。
+///
+/// 现在改为按策略惰性处理，从"零副作用"到"完全兼容旧行为"依次递进：
+/// - `Off`：完全不碰输入法与键盘布局
+/// - `Imm`：只关闭前台窗口的 IME 输入状态（直接输入），不触碰键盘布局 —— 默认
+/// - `Layout`：切换到英文键盘布局，但**只复用系统里已加载的**英文布局，绝不新增
+/// - `LayoutForce`：找不到英文布局时才惰性加载（不带 KLF_ACTIVATE），并在退出时卸载
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImeProtection {
+    /// 完全关闭输入法保护
+    Off,
+    /// 仅关闭前台窗口 IME 输入状态（零副作用，不会新增键盘布局）
+    #[default]
+    Imm,
+    /// 切换到英文键盘布局，但只复用已加载的布局
+    Layout,
+    /// 切换到英文键盘布局，必要时惰性加载（退出时卸载）
+    LayoutForce,
+}
+
+impl ImeProtection {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            ImeProtection::Off => "关闭（不干预输入法）",
+            ImeProtection::Imm => "关闭 IME 输入状态（推荐，无副作用）",
+            ImeProtection::Layout => "切英文布局（仅复用已装布局）",
+            ImeProtection::LayoutForce => "切英文布局（必要时加载 ENG）",
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ImeProtection::Off => "off",
+            ImeProtection::Imm => "imm",
+            ImeProtection::Layout => "layout",
+            ImeProtection::LayoutForce => "layout-force",
+        }
+    }
+
+    /// 该策略是否允许通过 LoadKeyboardLayoutW 向系统新增英文布局
+    pub fn allows_loading_layout(&self) -> bool {
+        matches!(self, ImeProtection::LayoutForce)
+    }
+
+    pub fn all() -> &'static [ImeProtection] {
+        &[
+            ImeProtection::Off,
+            ImeProtection::Imm,
+            ImeProtection::Layout,
+            ImeProtection::LayoutForce,
+        ]
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -86,6 +152,7 @@ impl Default for AppConfig {
             runtime_mode: RuntimeMode::Fast,
             paste_format: PasteFormat::Plain,
             path_style: PathStyle::default(),
+            ime_protection: ImeProtection::default(),
         }
     }
 }

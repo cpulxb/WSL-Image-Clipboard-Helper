@@ -2,3 +2,10 @@ hotkey = "!Enter"
 runtime_mode = "safe"
 paste_format = "plain"
 path_style = "plain"
+
+# 输入法保护策略（仅 runtime_mode = "safe" 时生效）
+#   off          = 完全不干预输入法
+#   imm          = 仅关闭前台窗口 IME 输入状态（默认，不会新增键盘布局）
+#   layout       = 切英文键盘布局，但只复用系统里已安装的布局
+#   layout-force = 找不到英文布局时才加载 ENG，退出时自动卸载
+ime_protection = "imm"

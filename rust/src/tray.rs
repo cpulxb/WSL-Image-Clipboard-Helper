@@ -1,5 +1,5 @@
 use crate::cleanup;
-use crate::config::{AppConfig, PathStyle, RuntimeMode};
+use crate::config::{AppConfig, ImeProtection, PathStyle, RuntimeMode};
 use crate::hotkey::{HotkeyManager, HotkeyType};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -29,6 +29,10 @@ const CMD_EXIT: u32 = 4001;
 const CMD_STYLE_PLAIN: u32 = 5001;
 const CMD_STYLE_AT: u32 = 5002;
 const CMD_STYLE_QUOTED: u32 = 5003;
+const CMD_IME_OFF: u32 = 6001;
+const CMD_IME_IMM: u32 = 6002;
+const CMD_IME_LAYOUT: u32 = 6003;
+const CMD_IME_LAYOUT_FORCE: u32 = 6004;
 
 /// 托盘发往主循环的命令
 #[derive(Debug, Clone)]
@@ -36,6 +40,7 @@ pub enum TrayCommand {
     SwitchHotkey(HotkeyType),
     SwitchMode(RuntimeMode),
     SwitchPathStyle(PathStyle),
+    SwitchImeProtection(ImeProtection),
     OpenFolder,
     Exit,
 }
@@ -347,6 +352,37 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let style_label: Vec<u16> = "路径格式\0".encode_utf16().collect();
     let _ = AppendMenuW(h_menu, MF_POPUP, h_style_menu.0 as usize, PCWSTR::from_raw(style_label.as_ptr()));
 
+    // ---- 输入法保护子菜单（issue #10）----
+    // 兼容模式下具体用哪种手段保护输入法，可在这里彻底关掉
+    let h_ime_menu = match CreatePopupMenu() {
+        Ok(m) => m,
+        Err(_) => { let _ = DestroyMenu(h_menu); return; }
+    };
+
+    let current_ime = state.config.ime_protection;
+    for policy in ImeProtection::all() {
+        let label = format!("{}\0", policy.display_name());
+        let label_w: Vec<u16> = label.encode_utf16().collect();
+        let cmd_id = match policy {
+            ImeProtection::Off => CMD_IME_OFF,
+            ImeProtection::Imm => CMD_IME_IMM,
+            ImeProtection::Layout => CMD_IME_LAYOUT,
+            ImeProtection::LayoutForce => CMD_IME_LAYOUT_FORCE,
+        };
+        let mut flags = MF_STRING;
+        if *policy == current_ime {
+            flags |= MF_CHECKED;
+        }
+        // 输入法保护只在兼容模式下生效，快速模式下置灰以免误解
+        if !is_safe {
+            flags |= MF_GRAYED;
+        }
+        let _ = AppendMenuW(h_ime_menu, flags, cmd_id as usize, PCWSTR::from_raw(label_w.as_ptr()));
+    }
+
+    let ime_label: Vec<u16> = "输入法保护\0".encode_utf16().collect();
+    let _ = AppendMenuW(h_menu, MF_POPUP, h_ime_menu.0 as usize, PCWSTR::from_raw(ime_label.as_ptr()));
+
     // ---- 分隔线 ----
     let _ = AppendMenuW(h_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
@@ -387,6 +423,10 @@ unsafe fn handle_menu_command(cmd_id: u32) {
         CMD_STYLE_PLAIN => switch_path_style(state, PathStyle::Plain),
         CMD_STYLE_AT => switch_path_style(state, PathStyle::At),
         CMD_STYLE_QUOTED => switch_path_style(state, PathStyle::Quoted),
+        CMD_IME_OFF => switch_ime_protection(state, ImeProtection::Off),
+        CMD_IME_IMM => switch_ime_protection(state, ImeProtection::Imm),
+        CMD_IME_LAYOUT => switch_ime_protection(state, ImeProtection::Layout),
+        CMD_IME_LAYOUT_FORCE => switch_ime_protection(state, ImeProtection::LayoutForce),
         CMD_OPEN_FOLDER => {
             let _ = state.cmd_tx.send(TrayCommand::OpenFolder);
         }
@@ -432,6 +472,19 @@ unsafe fn switch_path_style(state: &mut TrayState, style: PathStyle) {
 
     let _ = state.cmd_tx.send(TrayCommand::SwitchPathStyle(style));
     info!("已切换路径格式: {}", style.display_name());
+}
+
+/// 切换输入法保护策略
+unsafe fn switch_ime_protection(state: &mut TrayState, policy: ImeProtection) {
+    if state.config.ime_protection == policy {
+        return;
+    }
+
+    state.config.ime_protection = policy;
+    let _ = state.config.save();
+
+    let _ = state.cmd_tx.send(TrayCommand::SwitchImeProtection(policy));
+    info!("已切换输入法保护: {}", policy.display_name());
 }
 
 /// 切换模式

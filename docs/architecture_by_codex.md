@@ -100,7 +100,7 @@ ConvertPathToWsl(winPath) {
 
 ### 技术要点
 
-- **输入法保护**：通过 `LoadKeyboardLayoutW` 预加载英文布局（HKL 0x00000409），并使用 `PostMessage(0x50, ...)` 切换，降低与前台应用的竞争。
+- **输入法保护**：v3 AHK 版在启动时调用 `LoadKeyboardLayoutW`（带 `KLF_ACTIVATE`）预加载英文布局（HKL 0x00000409），再用 `PostMessage(0x50, ...)` 切换。⚠️ 该做法会把英文布局登记进**系统**输入法列表，导致 `Win+Space` 里多出 `ENG / English (United States)`（[issue #10](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/10)）；Rust v4.1.3 已改为惰性解析 + 默认走 IMM（详见 `rust/src/paste.rs` 与 `config::ImeProtection`），AHK 版仍保留旧行为。
 - **编码策略**：包含中文或 emoji 的 PowerShell 文件必须使用 UTF-8 with BOM，因为 PowerShell 解析器依赖 BOM 来正确识别 UTF-8 编码；若全为 ASCII，可保持无 BOM。
 - **错误容错**：异步脚本内部捕获异常，避免弹窗；必要时可扩展成日志文件或托盘通知。
 - **路径转换优先级**：优先使用内置正则匹配（快速），失败时回退到 `wsl wslpath` 命令（兼容性）。
@@ -209,7 +209,7 @@ ConvertPathToWsl(winPath) {
 
 ### Technical Highlights
 
-- **Input Method Protection**: Preload the English layout (HKL 0x00000409) via `LoadKeyboardLayoutW` and switch with `PostMessage(0x50, ...)` to reduce contention with the foreground app.
+- **Input Method Protection**: The v3 AHK build preloads the English layout (HKL 0x00000409) via `LoadKeyboardLayoutW` with `KLF_ACTIVATE` at startup and switches with `PostMessage(0x50, ...)`. ⚠️ That registers the layout with the **system** input list, which makes an extra `ENG / English (United States)` appear in `Win+Space` ([issue #10](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/10)). Rust v4.1.3 replaced it with lazy resolution and an IMM-based default (see `rust/src/paste.rs` and `config::ImeProtection`); the AHK build still has the old behaviour.
 - **Encoding Strategy**: Save PowerShell files that contain Chinese or emoji as UTF-8 with BOM, as PowerShell's parser relies on BOM to correctly identify UTF-8 encoding; ASCII-only files can remain without BOM.
 - **Error Handling**: Async scripts capture exceptions and suppress pop-ups; optional logging or tray notifications can be layered in later.
 - **Path Conversion Priority**: Use built-in regex matching first (fast), fallback to `wsl wslpath` command (compatibility).

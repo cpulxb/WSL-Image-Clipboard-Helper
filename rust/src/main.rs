@@ -14,14 +14,14 @@ mod paste;
 mod tray;
 
 use clipboard::ClipboardManager;
-use config::{PathStyle, RuntimeMode};
-use paste::HKL;
+use config::{ImeProtection, PathStyle, RuntimeMode};
 use tray::TrayCommand;
 
 /// 应用运行时状态（可被托盘命令修改）
 struct AppState {
     runtime_mode: RuntimeMode,
     path_style: PathStyle,
+    ime_protection: ImeProtection,
 }
 
 #[tokio::main]
@@ -38,8 +38,10 @@ async fn main() -> Result<()> {
     // 加载配置
     let app_config = config::AppConfig::load().unwrap_or_default();
     info!(
-        "加载配置: 热键={}, 模式={:?}",
-        app_config.hotkey, app_config.runtime_mode
+        "加载配置: 热键={}, 模式={:?}, 输入法保护={}",
+        app_config.hotkey,
+        app_config.runtime_mode,
+        app_config.ime_protection.as_str()
     );
 
     // 确定临时目录
@@ -51,9 +53,11 @@ async fn main() -> Result<()> {
 
     info!("临时目录: {}", temp_dir.display());
 
-    // 预加载英文输入法
-    let english_hkl = paste::preload_english_layout();
-    info!("英文输入法 HKL: {:#x}", english_hkl);
+    // 注意（issue #10）：这里**不再**预加载英文键盘布局。
+    // 旧实现在启动时无条件调用 LoadKeyboardLayoutW("00000409", KLF_ACTIVATE)，
+    // 会把英文布局登记进系统输入法列表，导致用户 Win+Space 里凭空多出
+    // `ENG / English (United States)`。现在英文布局只在确实需要时惰性解析，
+    // 且默认只复用系统已有布局，详见 config::ImeProtection。
 
     // 创建剪贴板管理器
     let clipboard_manager = ClipboardManager::new(temp_dir.clone());
@@ -62,6 +66,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(Mutex::new(AppState {
         runtime_mode: app_config.runtime_mode.clone(),
         path_style: app_config.path_style,
+        ime_protection: app_config.ime_protection,
     }));
 
     // 启动托盘（含热键管理器）
@@ -104,11 +109,11 @@ async fn main() -> Result<()> {
         tokio::select! {
             // 热键触发
             Some(_hotkey_id) = hotkey_rx.recv() => {
-                let (mode, path_style) = {
+                let (mode, path_style, ime_protection) = {
                     let s = state.lock().await;
-                    (s.runtime_mode.clone(), s.path_style)
+                    (s.runtime_mode.clone(), s.path_style, s.ime_protection)
                 };
-                match handle_paste(&clipboard_manager, &mode, path_style, english_hkl).await {
+                match handle_paste(&clipboard_manager, &mode, path_style, ime_protection).await {
                     Ok(_) => {}
                     Err(e) => {
                         error!("粘贴处理失败: {}", e);
@@ -130,6 +135,11 @@ async fn main() -> Result<()> {
                         info!("主循环: 路径格式已切换为 {}", style.display_name());
                         let mut s = state.lock().await;
                         s.path_style = style;
+                    }
+                    TrayCommand::SwitchImeProtection(policy) => {
+                        info!("主循环: 输入法保护已切换为 {}", policy.display_name());
+                        let mut s = state.lock().await;
+                        s.ime_protection = policy;
                     }
                     TrayCommand::OpenFolder => {
                         if let Err(e) = tray::open_temp_folder() {
@@ -154,6 +164,10 @@ async fn main() -> Result<()> {
         warn!("退出清理临时文件失败: {}", e);
     }
 
+    // 若本进程曾惰性加载过英文键盘布局（ime_protection = "layout-force"），
+    // 退出时卸载掉，不在用户的输入法切换列表里留下残留（issue #10）
+    paste::unload_self_loaded_layout();
+
     info!("WSL Clipboard Helper 已退出");
     std::process::exit(0);
 }
@@ -163,7 +177,7 @@ async fn handle_paste(
     clipboard_manager: &ClipboardManager,
     mode: &RuntimeMode,
     path_style: PathStyle,
-    english_hkl: HKL,
+    ime_protection: ImeProtection,
 ) -> Result<()> {
     // 0. 立即注入菜单屏蔽键：赶在物理 Alt 抬起之前，
     //    避免目标窗口把"Alt 按下→抬起"当成单击 Alt 激活菜单栏
@@ -176,7 +190,7 @@ async fn handle_paste(
                 let paste_text = path_style.format_paths(&wsl_paths);
 
                 let _ime_guard = match mode {
-                    RuntimeMode::Safe => Some(paste::ImeGuard::new(english_hkl)?),
+                    RuntimeMode::Safe => Some(paste::ImeGuard::new(ime_protection)),
                     RuntimeMode::Fast => None,
                 };
 
@@ -203,9 +217,9 @@ async fn handle_paste(
     info!("保存图片: {} bytes → {}", png_data.len(), win_path.display());
     image_saver::ensure_saved(&win_path, &png_data).await?;
 
-    // 4. 输入法保护（仅安全模式）
+    // 4. 输入法保护（仅安全模式，且由 ime_protection 策略决定具体手段）
     let _ime_guard = match mode {
-        RuntimeMode::Safe => Some(paste::ImeGuard::new(english_hkl)?),
+        RuntimeMode::Safe => Some(paste::ImeGuard::new(ime_protection)),
         RuntimeMode::Fast => None,
     };
 
