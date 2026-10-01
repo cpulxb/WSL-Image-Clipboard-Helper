@@ -62,6 +62,8 @@ jobs:
           New-Item -ItemType Directory -Path "$dir/temp" -Force | Out-Null
           Copy-Item rust/target/x86_64-pc-windows-msvc/release/wsl_clipboard.exe "$dir/"
           Copy-Item README.md "$dir/"
+          Copy-Item docs "$dir/docs" -Recurse
+          Copy-Item img "$dir/img" -Recurse
           # 打包用的默认配置与仓库根目录 wsl_clipboard.toml 保持一致（含远程粘贴示例注释）
           Copy-Item wsl_clipboard.toml "$dir/wsl_clipboard.toml"
           # 占位文件保证空的 temp/ 目录被打进压缩包

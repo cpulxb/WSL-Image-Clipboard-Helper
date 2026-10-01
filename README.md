@@ -34,12 +34,12 @@
 #### ✅ 解决方案
 本工具用于弥补这个缺口：通过全局快捷键（默认 `Alt+V`），自动读取 Windows 剪贴板图片，保存到本地 `temp/` 目录，并把对应 WSL 路径（`/mnt/c/...`）粘贴到当前输入窗口，让 AI 工具可以直接消费图片文件。
 
-当前主版本使用 Rust 实现。GitHub Release 提供预编译版本；下面注明“未发布”的改进对应当前源码和本地构建。
+当前版本为 Rust 实现的 `v4.2`，GitHub Release 提供预编译版本。
 
 ### ✨ 核心特性
 
-- 🚀 即时路径输出：触发热键后优先粘贴 `/mnt/...` 路径，减少等待时间
-- ⚡ 图片异步保存：路径先可用，图片文件后台写入，降低主流程阻塞
+- 🚀 图片路径粘贴：按热键保存图片，并粘贴本地 WSL 或远程 SSH 路径
+- ⚡ 先保存再粘贴：图片准备完成后再输出路径，避免 CLI 检查时文件尚未存在
 - 🌐 输入法保护（兼容模式）：粘贴前把前台窗口切到直接输入英文，结束后自动恢复；默认不改动系统键盘布局，可在托盘彻底关闭
 - 🧹 自动清理机制：周期清理过期 PNG，退出时清理临时图片
 - 🖱️ 托盘管理：支持切换热键、切换运行模式、打开临时图片目录、退出并清理临时图片
@@ -142,7 +142,7 @@ WSL-Image-Clipboard-Helper/
 
 适用场景：你在 Windows Terminal / WSL 里 `ssh` 到一台远程服务器，在上面运行 Codex、Claude Code 等 CLI（[issue #11](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/11)）。此时本地 `/mnt/c/...` 路径在远程不可见，热键会先把图片传过去、再粘贴远程路径。
 
-**以下自动认证与连接复用是当前源码新增功能，尚未发布到 GitHub Release。旧版本仍要求后台 SSH 能免交互认证。**
+**v4.2 支持远程图片上传、密码/密钥口令弹窗和持续连接复用。Windows 与 WSL 都可以按下面的步骤使用。**
 
 日常用法：照常 SSH 登录，在远程 CLI 输入框按 `Alt+V`。程序自动识别当前终端 tab，沿用登录所用的客户端、用户、主机、端口、`-i` 密钥、`-J` 跳板及 SSH config 别名。
 
@@ -288,7 +288,7 @@ v4.1.3 起：
 
 **Q6：我是 ssh 到远程服务器上跑 Codex 的，能直接粘贴图片吗？**（[issue #11](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/11)）
 
-可以。v4.2 引入远程图片上传；当前源码进一步支持密码/密钥口令弹窗和持续连接复用。Windows 和 WSL 都可以照常登录后按热键，首次上传可能需要额外认证，后续复用连接。详见上文「远程粘贴（SSH）」；旧 Release 的认证限制与当前源码不同。
+可以。v4.2 支持远程图片上传、密码/密钥口令弹窗和持续连接复用。Windows 和 WSL 都可以照常登录后按热键，首次上传可能需要额外认证，后续复用连接。详见上文「远程粘贴（SSH）」。
 
 ### 🛠️ Rust 版本编译（推荐）
 
@@ -344,22 +344,18 @@ rustup target add x86_64-pc-windows-msvc
 
 ### 🕒 版本历史
 
-#### 未发布：SSH 认证与连接复用
+#### v4.2（当前版本，Rust） ✅
 
-- Windows / WSL 均支持按需密码、密钥口令及 SSH 认证提示窗口，不保存密码
+- 新增远程粘贴：在终端里 SSH 到远程机器运行 CLI 时，先上传图片，再粘贴远程路径（#11）
+- 自动识别当前 tab 的交互式 SSH 会话，沿用客户端、用户、主机、端口、密钥、跳板和别名参数；本地 tab 继续使用本地路径
+- Windows / WSL 均支持按需密码、密钥口令及 SSH 认证提示窗口，密码不落盘
 - 优先使用已有密钥、agent 或 WSL ControlPath；建立上传连接后持续复用，断线后重新认证
 - WSL 保留原会话的 agent socket、发行版、用户、工作目录和含空格的参数
-- 退出取消等待中的认证并关闭现有连接；窗口改变时暂停粘贴，避免误贴
-- 自动化验证方法见 [SSH 认证测试](docs/ssh-auth-testing.md)
-
-#### v4.2（Rust） ✅
-
-- 新增 `远程粘贴（SSH）`：在终端里 ssh 到远程机器运行 CLI 时，图片先通过 ssh 上传到远程，再粘贴远程路径（#11）
-- 零配置：按热键时自动枚举当前打开的 ssh 会话（Windows 侧 `ssh.exe` 与 WSL 侧 `ssh`），复用其用户 / 主机 / 端口 / 密钥 / 跳板 / 别名参数；只识别交互式登录会话，`-N` 隧道、VS Code Remote-SSH、git 等不会误触发
-- 托盘子菜单可在 `自动` / `关闭` 间切换（`remote_paste` 配置项），多个 ssh tab 时可手动指定会话
-- 单连接传输（`mkdir -p && cat > FILE`，stdin 流式）到远程 `/tmp/wsl_clipboard-<uid>/`；Explorer 复制的文件同样上传
-- 同图重复粘贴不重复上传；退出时清理本会话上传的远程临时截图；上传失败弹托盘气泡且不粘贴
-- ssh 以 `BatchMode=yes` / `ConnectTimeout=5` 运行并有 60 秒总超时，且以 `CREATE_NO_WINDOW` 启动，不会闪出控制台窗口
+- 图片先完整上传再粘贴；同图重复粘贴复用已上传路径；支持从 Explorer 复制普通文件上传
+- 托盘可切换自动 / 关闭或固定会话；认证期间仍可退出，取消后不会误贴
+- 退出关闭已有连接并清理临时截图，保留上传的普通文件；剪贴板或前台窗口改变时暂停旧内容粘贴
+- 修复同一图片在本地与远程之间反复粘贴的缓存识别；新增单实例保护
+- 验证记录见 [SSH 认证测试](docs/ssh-auth-testing.md)
 
 #### v4.1.3（Rust） ✅
 
@@ -426,12 +422,12 @@ Many AI CLI agents (Codex, Amazon Q Developer CLI, OpenCode, Claude Code, etc.) 
 #### ✅ Solution
 This project automates that workaround with a global hotkey (default `Alt+V`): it captures clipboard image data, saves a PNG file, and pastes the WSL path (`/mnt/...`) into the active input control.
 
-The project uses Rust. GitHub Releases provide prebuilt binaries; changes marked unreleased describe the current source and local builds.
+The current Rust release is `v4.2`; prebuilt binaries are available on GitHub Releases.
 
 ### ✨ Highlights
 
-- 🚀 Fast path-first paste workflow
-- ⚡ Async image persistence
+- 🚀 Paste local WSL or remote SSH image paths with one hotkey
+- ⚡ Save images before pasting paths so CLI file checks can succeed
 - 🌐 IME guard in compatibility mode — closes the foreground IME before pasting and restores it afterwards, without altering system keyboard layouts (switchable, and fully disableable)
 - 🖱️ Tray-based hotkey and mode switching
 - 🧹 Automatic cleanup for temporary PNG files
@@ -439,7 +435,7 @@ The project uses Rust. GitHub Releases provide prebuilt binaries; changes marked
 - 🪟 Embedded multi-size app icons and a DPI-aware manifest
 - 📁 Explorer file path conversion: copy files in Explorer, then press `Alt+V` to paste `/mnt/...` paths
 - 🎯 Switchable path style: plain / `@`-prefixed (for Kimi Code CLI, Gemini CLI, Qwen Code) / quoted
-- 🌐 Remote paste over SSH: when the CLI runs on a remote host you `ssh` into, the helper detects the open SSH session automatically, uploads the image and pastes the remote path — zero configuration
+- 🌐 Remote paste over SSH: when the CLI runs on a remote host you `ssh` into, the helper detects the open SSH session automatically, uploads the image and pastes the remote path; authentication dialogs appear only when needed, and subsequent uploads reuse the connection
 
 ![clip_20260217_184919_809](./img/clip_20260217_184919_809.png)
 
@@ -505,13 +501,13 @@ WSL-Image-Clipboard-Helper/
 - To stop the helper from touching your IME at all, pick `关闭（不干预输入法）` under the tray `输入法保护` (IME guard) submenu.
 - If the tray icon is not visible, check the hidden icons area in the Windows taskbar.
 - Plain paths are pasted by default; for CLIs that need `@` file references (e.g. Kimi Code CLI), switch `路径格式` (path style) in the tray menu.
-- If the CLI runs on a remote host over SSH, the hotkey uploads the image there and pastes the remote path automatically; password and key authentication are supported in the current source; the first upload may request additional authentication — see below.
+- If the CLI runs on a remote host over SSH, the hotkey uploads the image there and pastes the remote path automatically; password and key authentication are supported; the first upload may request additional authentication — see below.
 
 ### 🌐 Remote paste over SSH
 
 For the case where you `ssh` from Windows Terminal / WSL into a server and run Codex, Claude Code, etc. **there** ([issue #11](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/11)). A local `/mnt/c/...` path is meaningless on the remote side, so the hotkey uploads the image first and pastes the remote path.
 
-**Automatic authentication and persistent uploads are unreleased source changes. Older Release binaries still require non-interactive background SSH authentication.**
+**v4.2 includes remote image uploads, password/passphrase dialogs and persistent upload connections for both Windows and WSL.**
 
 Log in normally, start your remote CLI, copy an image, and press `Alt+V`. The helper detects the current terminal tab and preserves the SSH client, user, host, port, identity file, jump host and config alias.
 
@@ -600,7 +596,7 @@ If an earlier version already left English (United States) in your language list
 
 **Q6: I run Codex on a remote server over SSH — can I still paste images?** ([issue #11](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/11))
 
-Yes. v4.2 introduced SSH uploads; the current source adds password/passphrase dialogs and persistent upload connections for both Windows and WSL. Log in normally and press the hotkey. The first upload may need extra authentication, then subsequent images reuse that connection. See “Remote paste over SSH”; older Release binaries have different authentication requirements.
+Yes. v4.2 includes SSH uploads, password/passphrase dialogs and persistent upload connections for both Windows and WSL. Log in normally and press the hotkey. The first upload may need extra authentication, then subsequent images reuse that connection. See “Remote paste over SSH”.
 
 If you prefer building from source:
 
