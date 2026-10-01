@@ -1,10 +1,11 @@
 use anyhow::{bail, Result};
 use std::sync::atomic::{AtomicIsize, Ordering};
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{GlobalFree, HGLOBAL, HWND, LPARAM, WPARAM};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
@@ -185,9 +186,27 @@ unsafe fn send_ime_control(ime_wnd: isize, sub_command: usize, lparam: isize) ->
     }
 }
 
-/// 粘贴文本到剪贴板并执行粘贴操作
+/// 粘贴文本到剪贴板并执行粘贴操作（文件列表使用）
 pub fn paste_text(text: &str) -> Result<()> {
+    if write_text(text, None)?.is_some() {
+        send_ctrl_v()?;
+    }
+    Ok(())
+}
+
+fn source_unchanged(expected: Option<u32>, actual: u32) -> bool {
+    expected.map_or(true, |seq| seq != 0 && seq == actual)
+}
+
+/// 返回 Some(写入序号) 表示写入成功；None 表示来源已变化，调用方不得发送按键。
+/// 写入与发送分开，确保发送失败后仍可识别本程序写入的图片路径。
+pub fn write_text(text: &str, expected_seq: Option<u32>) -> Result<Option<u32>> {
+    let marker = windows::core::GUID::new()?.to_u128().to_le_bytes();
     unsafe {
+        let marker_format = RegisterClipboardFormatW(windows::core::w!("WSLImageClipboardHelper.WriteMarker.v1"));
+        if marker_format == 0 {
+            bail!("无法注册剪贴板写入标记");
+        }
         // 尝试打开剪贴板，带重试机制
         if OpenClipboard(None).is_err() {
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -196,17 +215,16 @@ pub fn paste_text(text: &str) -> Result<()> {
             }
         }
 
-        // 清空剪贴板（关键修复：必须先清空再设置）
-        if let Err(e) = EmptyClipboard() {
+        let current_seq = GetClipboardSequenceNumber();
+        info!(?expected_seq, current_seq, "写入路径前核对剪贴板序号");
+        if !source_unchanged(expected_seq, current_seq) {
             CloseClipboard().ok();
-            bail!("清空剪贴板失败: {:?}", e);
+            return Ok(None);
         }
 
-        // 准备 UTF-16 编码的数据
+        // 清空前准备内存，分配失败不破坏当前剪贴板
         let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
         let byte_len = utf16.len() * std::mem::size_of::<u16>();
-
-        // 分配内存
         let h_mem = match GlobalAlloc(GMEM_MOVEABLE, byte_len) {
             Ok(mem) => mem,
             Err(e) => {
@@ -214,35 +232,114 @@ pub fn paste_text(text: &str) -> Result<()> {
                 bail!("分配剪贴板内存失败: {:?}", e);
             }
         };
-
         let ptr = GlobalLock(h_mem);
         if ptr.is_null() {
+            let _ = GlobalFree(h_mem);
             CloseClipboard().ok();
             bail!("锁定内存失败");
         }
-
-        // 复制数据
         std::ptr::copy_nonoverlapping(utf16.as_ptr() as *const u8, ptr as *mut u8, byte_len);
-
         let _ = GlobalUnlock(h_mem);
 
-        // 设置剪贴板数据
+        if let Err(e) = EmptyClipboard() {
+            let _ = GlobalFree(h_mem);
+            CloseClipboard().ok();
+            bail!("清空剪贴板失败: {:?}", e);
+        }
         if SetClipboardData(
             CF_UNICODETEXT.0 as u32,
             windows::Win32::Foundation::HANDLE(h_mem.0 as isize),
         )
         .is_err()
         {
+            let _ = GlobalFree(h_mem);
             CloseClipboard().ok();
             bail!("设置剪贴板数据失败");
         }
 
+        // CloseClipboard 会补齐文本格式并改变序号，先写唯一标记，再关闭并重新校验。
+        let marker_result = set_write_marker(marker_format, &marker);
+        let before_close_seq = GetClipboardSequenceNumber();
         CloseClipboard().ok();
+        marker_result?;
+
+        if OpenClipboard(None).is_err() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            OpenClipboard(None)?;
+        }
+        let marker_matches = write_marker_matches(marker_format, &marker);
+        let text_matches = crate::clipboard::ClipboardManager::read_unicode_text().as_deref() == Some(text);
+        let final_seq = GetClipboardSequenceNumber();
+        let confirmed = confirmed_write_sequence(final_seq, marker_matches, text_matches);
+        CloseClipboard().ok();
+        info!(before_close_seq, final_seq, marker_matches, text_matches,
+            "关闭后校验图片路径写入凭证");
+        Ok(confirmed)
+    }
+}
+
+unsafe fn set_write_marker(format: u32, marker: &[u8; 16]) -> Result<()> {
+    let mem = GlobalAlloc(GMEM_MOVEABLE, marker.len())?;
+    let ptr = GlobalLock(mem) as *mut u8;
+    if ptr.is_null() {
+        let _ = GlobalFree(mem);
+        bail!("无法锁定剪贴板写入标记内存");
+    }
+    std::ptr::copy_nonoverlapping(marker.as_ptr(), ptr, marker.len());
+    let _ = GlobalUnlock(mem);
+    if let Err(e) = SetClipboardData(format, windows::Win32::Foundation::HANDLE(mem.0 as isize)) {
+        let _ = GlobalFree(mem);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+unsafe fn write_marker_matches(format: u32, expected: &[u8; 16]) -> bool {
+    let Ok(data) = GetClipboardData(format) else { return false };
+    let mem = HGLOBAL(data.0 as *mut _);
+    if GlobalSize(mem) < expected.len() {
+        return false;
+    }
+    let ptr = GlobalLock(mem) as *const u8;
+    if ptr.is_null() {
+        return false;
+    }
+    let matches = std::slice::from_raw_parts(ptr, expected.len()) == expected;
+    let _ = GlobalUnlock(mem);
+    matches
+}
+
+fn confirmed_write_sequence(seq: u32, marker_matches: bool, text_matches: bool) -> Option<u32> {
+    (seq != 0 && marker_matches && text_matches).then_some(seq)
+}
+
+#[cfg(test)]
+mod clipboard_write_tests {
+    use super::{confirmed_write_sequence, source_unchanged};
+
+    #[test]
+    fn capture_final_sequence_after_close_not_the_intermediate_one() {
+        // 真机日志：写入时 543，CloseClipboard 后 546。只记录二次校验的最终序号。
+        assert_eq!(confirmed_write_sequence(546, true, true), Some(546));
+        assert_ne!(confirmed_write_sequence(546, true, true), Some(543));
     }
 
-    // 发送粘贴快捷键
-    send_ctrl_v()?;
-    Ok(())
+    #[test]
+    fn identical_new_text_without_our_marker_is_not_our_write() {
+        assert_eq!(confirmed_write_sequence(547, false, true), None);
+        assert_eq!(confirmed_write_sequence(547, true, false), None);
+        assert_eq!(confirmed_write_sequence(0, true, true), None);
+    }
+
+    #[test]
+    fn changed_or_unknown_source_cancels_image_write() {
+        assert!(source_unchanged(Some(12), 12));
+        assert!(!source_unchanged(Some(12), 13));
+        assert!(!source_unchanged(Some(0), 0));
+        assert!(!source_unchanged(Some(12), 0));
+        // 文件列表包装函数保留原有无条件写入行为
+        assert!(source_unchanged(None, 13));
+    }
 }
 
 /// 菜单屏蔽键：与 AHK 的 A_MenuMaskKey（vkFF）一致。

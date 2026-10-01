@@ -6,7 +6,7 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, GetClipboardData, OpenClipboard,
 };
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
-use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_HDROP};
+use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 
 use tracing::{info, warn};
@@ -27,6 +27,180 @@ struct ImageCache {
     win_path: PathBuf,
     /// WSL 路径
     wsl_path: String,
+    /// 本图最近一次由程序写入的完整路径文本；None 表示仍是原始图片
+    written_text: Option<String>,
+}
+
+impl ImageCache {
+    fn matches(&self, seq: u32, text: Option<&str>) -> bool {
+        seq != 0 && self.seq == seq && self.written_text.as_deref() == text
+    }
+
+    fn record_write(&mut self, source_seq: u32, written_seq: u32, text: &str) {
+        if source_seq != 0 && self.seq == source_seq {
+            self.seq = written_seq;
+            self.written_text = Some(text.to_owned());
+        }
+    }
+
+    fn image(&self) -> PasteImage {
+        PasteImage {
+            source_seq: self.seq,
+            win_path: self.win_path.clone(),
+            wsl_path: self.wsl_path.clone(),
+            png_data: self.png_data.clone(),
+        }
+    }
+}
+
+/// 一次图片粘贴的数据及其剪贴板来源，用于上传后的条件写入
+pub struct PasteImage {
+    pub source_seq: u32,
+    pub win_path: PathBuf,
+    pub wsl_path: String,
+    pub png_data: Vec<u8>,
+}
+
+#[cfg(test)]
+mod repeat_image_tests {
+    use super::*;
+
+    fn image() -> ImageCache {
+        ImageCache {
+            seq: 10,
+            png_data: vec![1, 2, 3],
+            win_path: PathBuf::from(r"C:\temp\clip.png"),
+            wsl_path: "/mnt/c/temp/clip.png".into(),
+            written_text: None,
+        }
+    }
+
+    #[test]
+    fn repeated_image_survives_remote_local_remote_writes() {
+        let mut cache = image();
+        assert!(cache.matches(10, None));
+        for (source, written, text) in [
+            (10, 11, "/tmp/remote-a/clip.png"),
+            (11, 12, "@\"/mnt/c/temp/clip.png\""),
+            (12, 13, "/tmp/remote-b/clip.png"),
+            (13, 14, "/tmp/remote-b/clip.png"),
+        ] {
+            cache.record_write(source, written, text);
+            assert!(cache.matches(written, Some(text)));
+            assert!(!cache.matches(source, Some(text)));
+            assert!(!cache.matches(written, None));
+            let data = cache.image();
+            assert_eq!(data.source_seq, written);
+            assert_eq!(data.wsl_path, "/mnt/c/temp/clip.png");
+            assert_eq!(data.png_data, vec![1, 2, 3]);
+        }
+    }
+
+    #[test]
+    fn new_copy_even_of_identical_text_is_not_the_cached_image() {
+        let mut cache = image();
+        cache.record_write(10, 11, "/tmp/clip.png");
+        assert!(!cache.matches(12, Some("/tmp/clip.png")));
+        assert!(!cache.matches(11, Some("ordinary text")));
+        assert!(!cache.matches(12, None)); // 新图片或文件列表
+        assert!(!cache.matches(0, Some("/tmp/clip.png")));
+        cache.record_write(10, 12, "stale operation");
+        assert!(cache.matches(11, Some("/tmp/clip.png")));
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn CreateWindowStationW(name: *const u16, flags: u32, access: u32, security: *const u8) -> isize;
+        fn GetProcessWindowStation() -> isize;
+        fn SetProcessWindowStation(station: isize) -> i32;
+        fn CloseWindowStation(station: isize) -> i32;
+    }
+
+    #[test]
+    #[ignore = "仅显式单线程运行：在独立 window station 中测试真实剪贴板，不发送按键"]
+    fn isolated_clipboard_remote_then_local() {
+        use crate::paste::write_text;
+        use windows::Win32::System::DataExchange::{EmptyClipboard, SetClipboardData};
+        use windows::Win32::System::Memory::{GlobalAlloc, GMEM_MOVEABLE};
+
+        struct Station { original: isize, isolated: isize }
+        impl Drop for Station {
+            fn drop(&mut self) {
+                unsafe {
+                    assert_ne!(SetProcessWindowStation(self.original), 0);
+                    assert_ne!(CloseWindowStation(self.isolated), 0);
+                }
+            }
+        }
+        unsafe {
+            let name: Vec<u16> = format!("WslClipboardTest-{}-{}", std::process::id(),
+                chrono::Utc::now().timestamp_millis()).encode_utf16().chain(Some(0)).collect();
+            let original = GetProcessWindowStation();
+            assert_ne!(original, 0);
+            let isolated = CreateWindowStationW(name.as_ptr(), 0, 0x037f, std::ptr::null());
+            assert_ne!(isolated, 0, "无法创建隔离 window station，禁止回退到用户剪贴板: {}", windows::core::Error::from_win32());
+            if SetProcessWindowStation(isolated) == 0 {
+                CloseWindowStation(isolated);
+                panic!("无法切换到隔离 window station，禁止操作用户剪贴板");
+            }
+            let _station = Station { original, isolated };
+            assert_eq!(GetProcessWindowStation(), isolated);
+
+            // 1x1、24 位的 DIB：40 字节头 + 4 字节对齐像素
+            let mut dib = vec![0u8; 44];
+            dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+            dib[4..8].copy_from_slice(&1i32.to_le_bytes());
+            dib[8..12].copy_from_slice(&1i32.to_le_bytes());
+            dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+            dib[14..16].copy_from_slice(&24u16.to_le_bytes());
+            dib[20..24].copy_from_slice(&4u32.to_le_bytes());
+            dib[40..43].copy_from_slice(&[0, 0, 255]);
+            OpenClipboard(None).unwrap();
+            EmptyClipboard().unwrap();
+            let mem = GlobalAlloc(GMEM_MOVEABLE, dib.len()).unwrap();
+            let ptr = GlobalLock(mem) as *mut u8;
+            assert!(!ptr.is_null());
+            std::ptr::copy_nonoverlapping(dib.as_ptr(), ptr, dib.len());
+            let _ = GlobalUnlock(mem);
+            SetClipboardData(CF_DIB.0 as u32, HANDLE(mem.0 as isize)).unwrap();
+            CloseClipboard().unwrap();
+
+            let manager = ClipboardManager::new(PathBuf::from(r"C:\temp"));
+            assert!(manager.has_image());
+            let first = manager.read_image_for_paste().unwrap();
+            assert!(!first.png_data.is_empty());
+            let mut source = first.source_seq;
+            for text in ["/tmp/remote/clip.png", first.wsl_path.as_str(), "/tmp/remote/clip.png"] {
+                let written = write_text(text, Some(source)).unwrap().unwrap();
+                manager.record_image_text(source, written, text);
+                assert!(!manager.has_image());
+                let cached = manager.read_own_image_text().unwrap().expect("自身路径应仍可识别为原图");
+                assert_eq!(cached.png_data, first.png_data);
+                assert_eq!(cached.win_path, first.win_path);
+                assert_eq!(cached.source_seq, written, "锁内取得的序号必须在关闭剪贴板后仍有效");
+                source = written;
+            }
+            // 模拟用户复制完全相同的文本，不能复用，也不能被旧上传结果覆盖
+            write_text("/tmp/remote/clip.png", None).unwrap();
+            assert!(manager.read_own_image_text().unwrap().is_none());
+            assert!(write_text("stale upload", Some(source)).unwrap().is_none());
+            OpenClipboard(None).unwrap();
+            assert_eq!(ClipboardManager::read_unicode_text().as_deref(), Some("/tmp/remote/clip.png"));
+            CloseClipboard().unwrap();
+        }
+    }
+
+    #[test]
+    fn successful_write_remains_retryable_without_successful_input() {
+        let mut cache = image();
+        // 写入后立即登记；按键发送是否成功不改变这个状态
+        cache.record_write(10, 11, "/tmp/clip.png");
+        assert!(cache.matches(11, Some("/tmp/clip.png")));
+        // 无法取得写入序号时，不允许复用之前的凭证
+        cache.record_write(11, 0, "/mnt/c/temp/clip.png");
+        assert!(!cache.matches(0, Some("/mnt/c/temp/clip.png")));
+        assert!(!cache.matches(11, Some("/tmp/clip.png")));
+    }
 }
 
 /// 剪贴板管理器
@@ -78,32 +252,100 @@ impl ClipboardManager {
         }
     }
 
+    /// 读取 Explorer 复制的原始 Windows 路径（远程模式下需要按本地路径打开文件上传）
+    pub fn read_file_list_raw(&self) -> Option<Vec<String>> {
+        let paths: Vec<String> = self
+            .get_file_paths()?
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect();
+        if paths.is_empty() {
+            None
+        } else {
+            Some(paths)
+        }
+    }
+
     /// 获取当前剪贴板序列号
     fn get_sequence(&self) -> u32 {
         unsafe { GetClipboardSequenceNumber() }
     }
 
-    /// 读取图片并准备粘贴数据（含缓存）
-    /// 返回 (win_path, wsl_path, png_data)
-    pub fn read_image_for_paste(&self) -> Option<(PathBuf, String, Vec<u8>)> {
+    /// 只认本程序为缓存图片写入的文本，不把用户复制的路径当作图片。
+    pub fn read_own_image_text(&self) -> anyhow::Result<Option<PasteImage>> {
+        // 普通文本不必打开剪贴板；若可能是自身文本但打不开，应报错而不是粘旧路径。
         let seq = self.get_sequence();
+        let candidate = self.cache.lock().ok().is_some_and(|cache| {
+            info!(current_seq = seq, cached_seq = ?cache.as_ref().map(|c| c.seq),
+                has_written_text = cache.as_ref().is_some_and(|c| c.written_text.is_some()),
+                "检查自身图片路径缓存");
+            cache.as_ref().is_some_and(|cached| {
+                seq != 0 && cached.seq == seq && cached.written_text.is_some()
+            })
+        });
+        if !candidate {
+            return Ok(None);
+        }
+        unsafe {
+            OpenClipboard(None).map_err(|e| anyhow::anyhow!("无法读取缓存图片对应的剪贴板文本: {}", e))?;
+            let result = (|| {
+                let seq = self.get_sequence();
+                let cache = self.cache.lock().ok()?;
+                let cached = cache.as_ref()?;
+                if seq == 0 || cached.seq != seq || cached.written_text.is_none() {
+                    return None;
+                }
+                let text = Self::read_unicode_text()?;
+                if cached.matches(seq, Some(&text)) && self.get_sequence() == seq {
+                    Some(cached.image())
+                } else {
+                    None
+                }
+            })();
+            CloseClipboard().ok();
+            info!(cache_hit = result.is_some(), "自身图片路径校验完成");
+            Ok(result)
+        }
+    }
 
-        // 检查缓存
+    pub(crate) unsafe fn read_unicode_text() -> Option<String> {
+        let data = GetClipboardData(CF_UNICODETEXT.0 as u32).ok()?;
+        let mem = HGLOBAL(data.0 as *mut _);
+        let len = GlobalSize(mem) / std::mem::size_of::<u16>();
+        let ptr = GlobalLock(mem) as *const u16;
+        if ptr.is_null() {
+            return None;
+        }
+        let units = std::slice::from_raw_parts(ptr, len);
+        let text = units.iter().position(|&u| u == 0)
+            .and_then(|end| String::from_utf16(&units[..end]).ok());
+        let _ = GlobalUnlock(mem);
+        text
+    }
+
+    pub fn record_image_text(&self, source_seq: u32, written_seq: u32, text: &str) {
+        if let Ok(mut cache) = self.cache.lock() {
+            if let Some(cached) = cache.as_mut() {
+                cached.record_write(source_seq, written_seq, text);
+                info!(source_seq, written_seq, cached_seq = cached.seq, "登记图片路径写入凭证");
+            }
+        }
+    }
+
+    /// 读取真实图片并准备粘贴数据（含缓存及来源序号）
+    pub fn read_image_for_paste(&self) -> Option<PasteImage> {
+        let seq = self.get_sequence();
         if let Ok(cache) = self.cache.lock() {
             if let Some(ref cached) = *cache {
-                if cached.seq == seq && seq != 0 {
+                if cached.matches(seq, None) {
                     info!("使用缓存的图片数据 (seq={})", seq);
-                    return Some((
-                        cached.win_path.clone(),
-                        cached.wsl_path.clone(),
-                        cached.png_data.clone(),
-                    ));
+                    return Some(cached.image());
                 }
             }
         }
 
-        // 读取新数据
-        let png_data = self.get_image_data()?;
+        // 数据与 sequence 在同一次打开剪贴板期间取得
+        let (seq, png_data) = self.get_image_data()?;
 
         // 生成文件名和路径
         let now = chrono::Local::now();
@@ -124,10 +366,11 @@ impl ClipboardManager {
                 png_data: png_data.clone(),
                 win_path: win_path.clone(),
                 wsl_path: wsl_path.clone(),
+                written_text: None,
             });
         }
 
-        Some((win_path, wsl_path, png_data))
+        Some(PasteImage { source_seq: seq, win_path, wsl_path, png_data })
     }
 
     fn get_file_paths(&self) -> Option<Vec<String>> {
@@ -153,7 +396,7 @@ impl ClipboardManager {
     }
 
     /// 获取图片数据并转换为 PNG
-    fn get_image_data(&self) -> Option<Vec<u8>> {
+    fn get_image_data(&self) -> Option<(u32, Vec<u8>)> {
         unsafe {
             if OpenClipboard(None).is_err() {
                 return None;
@@ -169,13 +412,15 @@ impl ClipboardManager {
                 return None;
             };
 
+            // GetClipboardData 可触发延迟渲染；在数据读取后、释放锁前绑定序号
+            let seq = self.get_sequence();
             CloseClipboard().ok();
 
             if let Some(dib) = dib_data {
-                if dib.is_empty() {
+                if dib.is_empty() || seq == 0 {
                     return None;
                 }
-                return Self::convert_dib_to_png(&dib);
+                return Self::convert_dib_to_png(&dib).map(|png| (seq, png));
             }
 
             None

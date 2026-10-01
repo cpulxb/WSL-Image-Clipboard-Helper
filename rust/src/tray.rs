@@ -1,21 +1,25 @@
 use crate::cleanup;
 use crate::config::{AppConfig, ImeProtection, PathStyle, RuntimeMode};
 use crate::hotkey::{HotkeyManager, HotkeyType};
+use crate::remote::{self, RemoteMode, SshSession};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use tracing::{error, info, warn};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// 托盘图标回调消息
 const WM_TRAYICON: u32 = WM_APP + 100;
+/// 其他线程请求弹托盘气泡提示：lparam 为 Box<(标题, 正文)> 的裸指针
+const WM_TRAY_NOTIFY: u32 = WM_APP + 101;
 const APP_ICON_ID: u16 = 1;
 
 /// 菜单命令 ID
@@ -33,6 +37,11 @@ const CMD_IME_OFF: u32 = 6001;
 const CMD_IME_IMM: u32 = 6002;
 const CMD_IME_LAYOUT: u32 = 6003;
 const CMD_IME_LAYOUT_FORCE: u32 = 6004;
+const CMD_REMOTE_OFF: u32 = 7001;
+const CMD_REMOTE_AUTO: u32 = 7002;
+/// 打开菜单时发现的 ssh 会话按顺序占用 CMD_REMOTE_BASE + 下标
+const CMD_REMOTE_BASE: u32 = 7100;
+const CMD_REMOTE_MAX: u32 = 7999;
 
 /// 托盘发往主循环的命令
 #[derive(Debug, Clone)]
@@ -41,6 +50,7 @@ pub enum TrayCommand {
     SwitchMode(RuntimeMode),
     SwitchPathStyle(PathStyle),
     SwitchImeProtection(ImeProtection),
+    SwitchRemoteMode(RemoteMode),
     OpenFolder,
     Exit,
 }
@@ -53,10 +63,16 @@ struct TrayState {
     cmd_tx: std_mpsc::Sender<TrayCommand>,
     temp_dir: PathBuf,
     session_end_cleanup_done: bool,
+    /// 远程粘贴模式（issue #11）；Off/Auto 持久化为 config.remote_paste，Pinned 只在本次运行有效
+    remote_mode: RemoteMode,
+    /// 上次打开菜单时发现的 ssh 会话，菜单项下标与之对应
+    discovered: Vec<SshSession>,
 }
 
 // 全局状态指针（仅托盘线程访问）
 static mut TRAY_STATE: *mut TrayState = std::ptr::null_mut();
+// 托盘窗口句柄：供其他线程 PostMessage 请求气泡提示（0 = 托盘未就绪）
+static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// 托盘控制器
 pub struct TrayController;
@@ -134,6 +150,7 @@ fn run_tray_thread(
         if hwnd.0 == 0 {
             anyhow::bail!("创建隐藏窗口失败");
         }
+        TRAY_HWND.store(hwnd.0, Ordering::SeqCst);
 
         // 创建托盘图标
         let mut nid = NOTIFYICONDATAW::default();
@@ -145,7 +162,8 @@ fn run_tray_thread(
         nid.hIcon = load_app_icon(h_instance.into())?;
 
         // 设置 tooltip
-        set_tooltip(&mut nid, &config);
+        let remote_paste = config.remote_paste;
+        set_tooltip(&mut nid, &config, &RemoteMode::from_config(remote_paste));
 
         Shell_NotifyIconW(NIM_ADD, &nid);
 
@@ -167,6 +185,8 @@ fn run_tray_thread(
             cmd_tx,
             temp_dir,
             session_end_cleanup_done: false,
+            remote_mode: RemoteMode::from_config(remote_paste),
+            discovered: Vec::new(),
         });
 
         TRAY_STATE = &mut *state as *mut TrayState;
@@ -186,6 +206,7 @@ fn run_tray_thread(
         if let Err(e) = state.hotkey_manager.unregister() {
             warn!("退出时注销热键失败: {}", e);
         }
+        TRAY_HWND.store(0, Ordering::SeqCst);
         Shell_NotifyIconW(NIM_DELETE, &state.nid);
         let _ = DestroyWindow(hwnd);
         let _ = UnregisterClassW(class_name, h_instance);
@@ -198,7 +219,7 @@ fn run_tray_thread(
 }
 
 /// 设置 tooltip 文本
-fn set_tooltip(nid: &mut NOTIFYICONDATAW, config: &AppConfig) {
+fn set_tooltip(nid: &mut NOTIFYICONDATAW, config: &AppConfig, remote_mode: &RemoteMode) {
     let hotkey_display = HotkeyType::from_config(&config.hotkey)
         .map(|h| h.display_name())
         .unwrap_or("Alt+V");
@@ -208,7 +229,14 @@ fn set_tooltip(nid: &mut NOTIFYICONDATAW, config: &AppConfig) {
         RuntimeMode::Fast => "快速",
     };
 
-    let tip = format!("WSL Clipboard ({} | {})", hotkey_display, mode_display);
+    let tip = match remote_mode {
+        RemoteMode::Off => format!("WSL Clipboard ({} | {})", hotkey_display, mode_display),
+        RemoteMode::Auto => format!("WSL Clipboard ({} | {} | SSH:自动)", hotkey_display, mode_display),
+        RemoteMode::Pinned(s) => format!(
+            "WSL Clipboard ({} | {} | SSH:{})",
+            hotkey_display, mode_display, s.destination
+        ),
+    };
     let tip_utf16: Vec<u16> = tip.encode_utf16().collect();
     let len = tip_utf16.len().min(nid.szTip.len() - 1);
     nid.szTip[..len].copy_from_slice(&tip_utf16[..len]);
@@ -236,6 +264,12 @@ unsafe extern "system" fn tray_wnd_proc(
         return LRESULT(0);
     }
 
+    if msg == WM_TRAY_NOTIFY {
+        let payload = Box::from_raw(lparam.0 as *mut (String, String));
+        show_balloon(&payload.0, &payload.1);
+        return LRESULT(0);
+    }
+
     if msg == WM_QUERYENDSESSION {
         return LRESULT(1);
     }
@@ -248,6 +282,44 @@ unsafe extern "system" fn tray_wnd_proc(
     }
 
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// 从任意线程请求托盘弹出警告气泡（程序没有主窗口，这是用户唯一能看到的失败反馈）
+pub fn notify_warning(title: &str, text: &str) {
+    let hwnd = TRAY_HWND.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    let payload = Box::new((title.to_string(), text.to_string()));
+    let ptr = Box::into_raw(payload);
+    unsafe {
+        if PostMessageW(HWND(hwnd), WM_TRAY_NOTIFY, WPARAM(0), LPARAM(ptr as isize)).is_err() {
+            // 投递失败则收回所有权，避免泄漏
+            drop(Box::from_raw(ptr));
+        }
+    }
+}
+
+/// 托盘线程：弹出气泡提示（szInfo 最多 255 个 UTF-16 单元，超出截断）
+unsafe fn show_balloon(title: &str, text: &str) {
+    if TRAY_STATE.is_null() {
+        return;
+    }
+    let state = &*TRAY_STATE;
+
+    let mut nid = state.nid;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_WARNING;
+    copy_utf16(&mut nid.szInfoTitle, title);
+    copy_utf16(&mut nid.szInfo, text);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+fn copy_utf16(dst: &mut [u16], src: &str) {
+    let utf16: Vec<u16> = src.encode_utf16().collect();
+    let len = utf16.len().min(dst.len() - 1);
+    dst[..len].copy_from_slice(&utf16[..len]);
+    dst[len] = 0;
 }
 
 unsafe fn handle_session_end() {
@@ -276,7 +348,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
     if TRAY_STATE.is_null() {
         return;
     }
-    let state = &*TRAY_STATE;
+    let state = &mut *TRAY_STATE;
 
     let h_menu = match CreatePopupMenu() {
         Ok(m) => m,
@@ -383,6 +455,45 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let ime_label: Vec<u16> = "输入法保护\0".encode_utf16().collect();
     let _ = AppendMenuW(h_menu, MF_POPUP, h_ime_menu.0 as usize, PCWSTR::from_raw(ime_label.as_ptr()));
 
+    // ---- 远程粘贴子菜单（issue #11）----
+    // 每次打开菜单都重新枚举当前的 ssh 会话，不需要用户配置目标
+    let h_remote_menu = match CreatePopupMenu() {
+        Ok(m) => m,
+        Err(_) => { let _ = DestroyMenu(h_menu); return; }
+    };
+
+    state.discovered = remote::discover_sessions();
+
+    let auto_label: Vec<u16> = "自动（当前 tab 是 ssh 才上传）\0".encode_utf16().collect();
+    let auto_flags = MF_STRING | if matches!(state.remote_mode, RemoteMode::Auto) { MF_CHECKED } else { MF_UNCHECKED };
+    let _ = AppendMenuW(h_remote_menu, auto_flags, CMD_REMOTE_AUTO as usize, PCWSTR::from_raw(auto_label.as_ptr()));
+
+    let off_label: Vec<u16> = "关闭（始终粘贴本地 /mnt 路径）\0".encode_utf16().collect();
+    let off_flags = MF_STRING | if matches!(state.remote_mode, RemoteMode::Off) { MF_CHECKED } else { MF_UNCHECKED };
+    let _ = AppendMenuW(h_remote_menu, off_flags, CMD_REMOTE_OFF as usize, PCWSTR::from_raw(off_label.as_ptr()));
+
+    let _ = AppendMenuW(h_remote_menu, MF_SEPARATOR, 0, PCWSTR::null());
+    if state.discovered.is_empty() {
+        let hint: Vec<u16> = "当前没有打开的 ssh 会话\0".encode_utf16().collect();
+        let _ = AppendMenuW(h_remote_menu, MF_STRING | MF_GRAYED, 0, PCWSTR::from_raw(hint.as_ptr()));
+    }
+    for (idx, session) in state.discovered.iter().enumerate() {
+        let cmd_id = CMD_REMOTE_BASE + idx as u32;
+        if cmd_id > CMD_REMOTE_MAX {
+            break;
+        }
+        let label = format!("{}\0", session.label());
+        let label_w: Vec<u16> = label.encode_utf16().collect();
+        let mut flags = MF_STRING;
+        if matches!(&state.remote_mode, RemoteMode::Pinned(p) if p.same_target(session)) {
+            flags |= MF_CHECKED;
+        }
+        let _ = AppendMenuW(h_remote_menu, flags, cmd_id as usize, PCWSTR::from_raw(label_w.as_ptr()));
+    }
+
+    let remote_label: Vec<u16> = "远程粘贴（SSH）\0".encode_utf16().collect();
+    let _ = AppendMenuW(h_menu, MF_POPUP, h_remote_menu.0 as usize, PCWSTR::from_raw(remote_label.as_ptr()));
+
     // ---- 分隔线 ----
     let _ = AppendMenuW(h_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
@@ -427,6 +538,15 @@ unsafe fn handle_menu_command(cmd_id: u32) {
         CMD_IME_IMM => switch_ime_protection(state, ImeProtection::Imm),
         CMD_IME_LAYOUT => switch_ime_protection(state, ImeProtection::Layout),
         CMD_IME_LAYOUT_FORCE => switch_ime_protection(state, ImeProtection::LayoutForce),
+        CMD_REMOTE_OFF => switch_remote_mode(state, RemoteMode::Off),
+        CMD_REMOTE_AUTO => switch_remote_mode(state, RemoteMode::Auto),
+        CMD_REMOTE_BASE..=CMD_REMOTE_MAX => {
+            let idx = (cmd_id - CMD_REMOTE_BASE) as usize;
+            if let Some(session) = state.discovered.get(idx) {
+                let session = session.clone();
+                switch_remote_mode(state, RemoteMode::Pinned(session));
+            }
+        }
         CMD_OPEN_FOLDER => {
             let _ = state.cmd_tx.send(TrayCommand::OpenFolder);
         }
@@ -453,7 +573,7 @@ unsafe fn switch_hotkey(state: &mut TrayState, hotkey_type: HotkeyType) {
     let _ = state.config.save();
 
     // 更新 tooltip
-    set_tooltip(&mut state.nid, &state.config);
+    set_tooltip(&mut state.nid, &state.config, &state.remote_mode);
     state.nid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &state.nid);
 
@@ -487,6 +607,24 @@ unsafe fn switch_ime_protection(state: &mut TrayState, policy: ImeProtection) {
     info!("已切换输入法保护: {}", policy.display_name());
 }
 
+/// 切换远程粘贴模式；只有"开 / 关"写进配置，指定的会话不持久化
+unsafe fn switch_remote_mode(state: &mut TrayState, mode: RemoteMode) {
+    let enabled = !matches!(mode, RemoteMode::Off);
+    if state.config.remote_paste != enabled {
+        state.config.remote_paste = enabled;
+        let _ = state.config.save();
+    }
+    state.remote_mode = mode.clone();
+
+    // 更新 tooltip
+    set_tooltip(&mut state.nid, &state.config, &state.remote_mode);
+    state.nid.uFlags = NIF_TIP;
+    Shell_NotifyIconW(NIM_MODIFY, &state.nid);
+
+    info!("远程粘贴已切换为: {}", mode.display_name());
+    let _ = state.cmd_tx.send(TrayCommand::SwitchRemoteMode(mode));
+}
+
 /// 切换模式
 unsafe fn switch_mode(state: &mut TrayState, mode: RuntimeMode) {
     let mode_str = match &mode {
@@ -506,7 +644,7 @@ unsafe fn switch_mode(state: &mut TrayState, mode: RuntimeMode) {
     let _ = state.config.save();
 
     // 更新 tooltip
-    set_tooltip(&mut state.nid, &state.config);
+    set_tooltip(&mut state.nid, &state.config, &state.remote_mode);
     state.nid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &state.nid);
 

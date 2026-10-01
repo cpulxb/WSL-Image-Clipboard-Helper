@@ -23,6 +23,15 @@ pub struct AppConfig {
     /// 旧版配置文件没有该字段，缺省按 imm 处理
     #[serde(default)]
     pub ime_protection: ImeProtection,
+
+    /// 远程粘贴（issue #11）：检测到打开的 ssh 会话时，图片先上传到远程再粘贴远程路径。
+    /// 关闭后始终粘贴本地 /mnt 路径。旧版配置文件没有该字段，缺省开启
+    #[serde(default = "default_true")]
+    pub remote_paste: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +162,7 @@ impl Default for AppConfig {
             paste_format: PasteFormat::Plain,
             path_style: PathStyle::default(),
             ime_protection: ImeProtection::default(),
+            remote_paste: true,
         }
     }
 }

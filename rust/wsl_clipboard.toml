@@ -9,3 +9,10 @@ path_style = "plain"
 #   layout       = 切英文键盘布局，但只复用系统里已安装的布局
 #   layout-force = 找不到英文布局时才加载 ENG，退出时自动卸载
 ime_protection = "imm"
+
+# 远程粘贴（SSH，issue #11）：在终端里 ssh 到远程机器跑 Codex / Claude Code 时，
+# 热键会自动识别当前打开的 ssh 会话，把图片上传到远程后粘贴远程路径，无需配置目标。
+# 只看你正在粘贴的那个终端 tab：本地 tab 里按热键仍粘贴本地 /mnt 路径。
+# 前提：该主机能用公钥免密登录（程序没有控制台，无法输入密码）。
+# true = 自动（默认）；false = 关闭，始终粘贴本地 /mnt 路径。也可在托盘菜单切换
+remote_paste = true

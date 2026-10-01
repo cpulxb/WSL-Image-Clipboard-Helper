@@ -47,6 +47,7 @@
 - 🪟 Windows 集成：内嵌多尺寸图标，并带 DPI-aware manifest，高 DPI 环境显示更稳定
 - 📁 Explorer 路径转换：在资源管理器复制文件后按 `Alt+V`，会粘贴对应 `/mnt/...` 路径
 - 🎯 路径格式可切换：纯路径 / `@` 前缀（适配 Kimi Code CLI、Gemini CLI、Qwen Code）/ 引号包裹
+- 🌐 远程粘贴（SSH）：在终端里 ssh 到远程机器跑 Codex / Claude Code 时，自动识别当前 ssh 会话，图片先上传到远程再粘贴远程路径，无需任何配置
 
 ![clip_20260217_184919_809](./img/clip_20260217_184919_809.png)
 
@@ -91,7 +92,7 @@ WSL-Image-Clipboard-Helper/
 ### 🚀 使用方式（Rust 版本）
 
 1. 最简单方式（推荐）：从 GitHub Release 下载已编译版本：
-   - `v4.1.2`：[https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.1.2](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.1.2)
+   - `v4.2`：[https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2)
    - latest release：[https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest)
 
 2. 将下载的 `wsl_clipboard.exe` 放到一个固定目录。
@@ -135,6 +136,39 @@ WSL-Image-Clipboard-Helper/
 - 不希望本工具碰输入法，可在托盘 `输入法保护` 中选择 `关闭（不干预输入法）`
 - 若托盘图标未显示，请检查任务栏隐藏图标区域
 - 默认粘贴纯路径；Kimi 等需要 `@` 文件引用的 CLI，请在托盘菜单切换 `路径格式`
+- 在终端里 ssh 到远程机器跑 CLI 时，热键会自动把图片传到远程再粘贴远程路径；前提是该主机能用公钥免密登录，见下文
+
+### 🌐 远程粘贴（SSH）
+
+适用场景：你在 Windows Terminal / WSL 里 `ssh` 到一台远程服务器，在上面运行 Codex、Claude Code 等 CLI（[issue #11](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/11)）。此时本地 `/mnt/c/...` 路径在远程不可见，热键会先把图片传过去、再粘贴远程路径。
+
+**用法和本地完全一样：在远程终端的 CLI 输入框按热键即可，不需要任何配置。** 程序会在按下热键时自动枚举当前打开的 ssh 会话（Windows 侧的 `ssh.exe` 和 WSL 里的 `ssh` 都算），找出**你正在粘贴的那个终端 tab** 里的会话，复用那条会话的 ssh 参数（用户、主机、端口、`-i` 密钥、`-J` 跳板、`~/.ssh/config` 别名等）新建一条连接上传图片，然后粘贴远程绝对路径（如 `/tmp/wsl_clipboard-1000/clip_20260917_120000_123.png`），CLI 照常识别成 `[Image #n]`。`路径格式`（`@` 前缀 / 引号）同样生效。
+
+唯一前提：**该主机要能用公钥免密登录**。程序没有控制台，新建的 ssh 连接无法输入密码。如果你平时是敲密码登录的，每台主机做一次（Windows 侧 PowerShell 示例，会要一次密码）：
+
+```powershell
+type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh user@host "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
+```
+
+没有密钥就先 `ssh-keygen -t ed25519`；从 WSL 侧 ssh 的话用 `ssh-copy-id user@host`。之后你平时登录也不用再输密码。
+
+托盘菜单 `远程粘贴（SSH）`：
+
+| 菜单项 | 行为 |
+| --- | --- |
+| `自动（当前 tab 是 ssh 才上传）`（默认） | 当前 tab 里有 ssh 会话就上传到它；本地 tab（或其他非终端程序）里按热键仍和以前一样粘贴本地 `/mnt` 路径 |
+| `关闭（始终粘贴本地 /mnt 路径）` | 完全不做远程上传（持久化到 `wsl_clipboard.toml` 的 `remote_paste = false`） |
+| 列出的各个会话 | 固定往这个会话传，不管当前在哪个 tab（自动判断不准时用；仅本次运行有效） |
+
+注意事项：
+
+- 只有**交互式登录**的 ssh 会被识别；`ssh -N` 端口转发、VS Code Remote-SSH（`-T`）、git 等带远程命令且没有 `-t` 的进程会被忽略，不会误触发。
+- 同一个 Windows Terminal 窗口里本地 tab 和 ssh tab 并存时，按热键前所在的 tab 决定粘本地路径还是上传。判断方法是给各 tab 的标题临时追加一个不可见的零宽字符、看窗口标题变成哪个，随即还原，不影响显示。判断不出具体 tab 时（profile 开了 `suppressApplicationTitle`、VS Code 等其他终端、WSL 里的 ssh 跑在 tmux / screen 中），退回为“前台程序里最近打开的 ssh 会话”；这种情况下若粘错，可在托盘里固定会话或关闭远程粘贴。
+- WSL 侧只枚举默认发行版里的 ssh；Windows 侧枚举所有 `ssh.exe`（含 Git 附带的），上传时复用发现到的那个可执行文件及其配置。
+- 上传目录固定为远程的 `/tmp/wsl_clipboard-<uid>/`，不存在会自动创建；传输只用一条 ssh 连接（远程执行 `mkdir -p DIR && cat > DIR/FILE`，文件走 stdin），不依赖远程装有 `scp` / `sftp-server`。每次粘贴多出一次 ssh 建连的耗时（通常零点几秒到一两秒）。
+- 上传失败（认证失败、主机不可达、超时等）会弹托盘气泡提示原因，并且**不粘贴任何内容**。
+- 同一张截图重复粘贴不会重复上传；程序退出时会删除本次会话上传到远程的临时截图，与本地 `temp/` 清理策略一致。
+- 在 Explorer 复制文件后按热键，文件同样会上传并粘贴远程路径（不支持目录）。
 
 ### ⌨️ 输入法保护策略
 
@@ -192,6 +226,10 @@ v4.1.3 起：
 
 如果你此前被旧版本影响，系统语言列表里已经留下了英语（美国），需要到 `设置 → 时间和语言 → 语言和区域` 手动删除一次；新版本不会再添加它。
 
+**Q6：我是 ssh 到远程服务器上跑 Codex 的，能直接粘贴图片吗？**（[issue #11](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/11)）
+
+可以，v4.2 起支持，且不需要配置：按热键时程序会自动找到你当前打开的 ssh 会话（无论是从 Windows 侧还是 WSL 侧 ssh 的），用同样的参数把图片上传到远程，再粘贴远程路径。唯一前提是这台主机能用公钥免密登录（程序没有控制台，无法替你输密码）；平时敲密码登录的话，先把本机公钥加进远程 `~/.ssh/authorized_keys`（每台主机一次）。详见上文「远程粘贴（SSH）」。
+
 ### 🛠️ Rust 版本编译（推荐）
 
 在仓库根目录执行：
@@ -246,7 +284,16 @@ rustup target add x86_64-pc-windows-msvc
 
 ### 🕒 版本历史
 
-#### v4.1.3（当前版本，Rust） ✅
+#### v4.2（当前版本，Rust） ✅
+
+- 新增 `远程粘贴（SSH）`：在终端里 ssh 到远程机器运行 CLI 时，图片先通过 ssh 上传到远程，再粘贴远程路径（#11）
+- 零配置：按热键时自动枚举当前打开的 ssh 会话（Windows 侧 `ssh.exe` 与 WSL 侧 `ssh`），复用其用户 / 主机 / 端口 / 密钥 / 跳板 / 别名参数；只识别交互式登录会话，`-N` 隧道、VS Code Remote-SSH、git 等不会误触发
+- 托盘子菜单可在 `自动` / `关闭` 间切换（`remote_paste` 配置项），多个 ssh tab 时可手动指定会话
+- 单连接传输（`mkdir -p && cat > FILE`，stdin 流式）到远程 `/tmp/wsl_clipboard-<uid>/`；Explorer 复制的文件同样上传
+- 同图重复粘贴不重复上传；退出时清理本会话上传的远程临时截图；上传失败弹托盘气泡且不粘贴
+- ssh 以 `BatchMode=yes` / `ConnectTimeout=5` 运行并有 60 秒总超时，且以 `CREATE_NO_WINDOW` 启动，不会闪出控制台窗口
+
+#### v4.1.3（Rust） ✅
 
 - 修复启动后系统输入法列表凭空多出 `ENG / English (United States)` 的问题：不再于启动时无条件调用 `LoadKeyboardLayoutW("00000409", KLF_ACTIVATE)`（#10）
 - 英文布局改为惰性解析，默认只复用系统已装布局；确需加载时不再使用 `KLF_ACTIVATE`，并在退出时自动卸载
@@ -324,6 +371,7 @@ Current mainline release is Rust-based (`v4.0`). The recommended path is to down
 - 🪟 Embedded multi-size app icons and a DPI-aware manifest
 - 📁 Explorer file path conversion: copy files in Explorer, then press `Alt+V` to paste `/mnt/...` paths
 - 🎯 Switchable path style: plain / `@`-prefixed (for Kimi Code CLI, Gemini CLI, Qwen Code) / quoted
+- 🌐 Remote paste over SSH: when the CLI runs on a remote host you `ssh` into, the helper detects the open SSH session automatically, uploads the image and pastes the remote path — zero configuration
 
 ![clip_20260217_184919_809](./img/clip_20260217_184919_809.png)
 
@@ -370,7 +418,7 @@ WSL-Image-Clipboard-Helper/
 ### 🚀 Usage (Rust version)
 
 1. Easiest way (recommended): download the prebuilt package from GitHub Releases:
-   - `v4.1.2`: [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.1.2](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.1.2)
+   - `v4.2`: [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2)
    - latest release: [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest)
 2. Put `wsl_clipboard.exe` in a fixed folder (ideally with `temp/` and `wsl_clipboard.toml`).
 3. Launch `wsl_clipboard.exe`.
@@ -389,6 +437,39 @@ WSL-Image-Clipboard-Helper/
 - To stop the helper from touching your IME at all, pick `关闭（不干预输入法）` under the tray `输入法保护` (IME guard) submenu.
 - If the tray icon is not visible, check the hidden icons area in the Windows taskbar.
 - Plain paths are pasted by default; for CLIs that need `@` file references (e.g. Kimi Code CLI), switch `路径格式` (path style) in the tray menu.
+- If the CLI runs on a remote host over SSH, the hotkey uploads the image there and pastes the remote path automatically; the host must accept key-based login — see below.
+
+### 🌐 Remote paste over SSH
+
+For the case where you `ssh` from Windows Terminal / WSL into a server and run Codex, Claude Code, etc. **there** ([issue #11](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/11)). A local `/mnt/c/...` path is meaningless on the remote side, so the hotkey uploads the image first and pastes the remote path.
+
+**It works exactly like local paste: press the hotkey in the CLI's input box inside the remote terminal. No configuration needed.** On each hotkey press the helper enumerates the SSH sessions currently open (both Windows-side `ssh.exe` and `ssh` inside WSL), picks the one in **the terminal tab you are pasting into**, reuses that session's SSH arguments (user, host, port, `-i` key, `-J` jump host, `~/.ssh/config` alias, …) to open one more connection for the upload, then pastes the absolute remote path (e.g. `/tmp/wsl_clipboard-1000/clip_20260917_120000_123.png`), which the CLI renders as `[Image #n]` as usual. The `路径格式` (path style) setting still applies.
+
+The one prerequisite: **the host must accept key-based (passwordless) login.** The helper has no console, so the extra connection cannot type a password. If you normally log in with a password, do this once per host (Windows-side PowerShell example; it asks for the password one last time):
+
+```powershell
+type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh user@host "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
+```
+
+Run `ssh-keygen -t ed25519` first if you have no key; from the WSL side simply use `ssh-copy-id user@host`. Your regular logins stop asking for a password too.
+
+Tray submenu `远程粘贴（SSH）` (remote paste):
+
+| Item | Behaviour |
+| --- | --- |
+| `自动（当前 tab 是 ssh 才上传）` — auto (default) | Upload only when the terminal tab you are pasting into runs an SSH session; in a local tab (or any non-terminal app) paste the local `/mnt` path as before |
+| `关闭（始终粘贴本地 /mnt 路径）` — off | Never upload (persisted as `remote_paste = false` in `wsl_clipboard.toml`) |
+| the listed sessions | Always upload to this session, whichever tab is active (a fallback when auto detection guesses wrong; for this run only) |
+
+Notes:
+
+- Only **interactive login** sessions are detected; `ssh -N` port forwards, VS Code Remote-SSH (`-T`), git and other invocations that run a remote command without `-t` are ignored, so they never trigger an upload.
+- With a local tab and an SSH tab side by side in one Windows Terminal window, the tab you press the hotkey in decides between the local path and an upload. The helper tells tabs apart by briefly appending an invisible zero-width character to each tab's title, seeing which one the window title picks up, and restoring it right away. When the tab cannot be determined (profile has `suppressApplicationTitle`, VS Code or other terminals, WSL `ssh` inside tmux/screen), it falls back to the most recently opened SSH session of the foreground app; pin a session or turn remote paste off in the tray if that guesses wrong.
+- On the WSL side only the default distro is scanned; on the Windows side every `ssh.exe` (including the one bundled with Git) is considered, and the upload reuses the very executable and configuration that session uses.
+- Files land in `/tmp/wsl_clipboard-<uid>/` on the remote host (created on demand). A single SSH connection does the transfer (`mkdir -p DIR && cat > DIR/FILE` with the file streamed via stdin), so `scp`/`sftp-server` are not required. Each paste costs one SSH connection setup (typically well under two seconds).
+- If the upload fails (auth failure, host unreachable, timeout…) a tray balloon shows the reason and **nothing is pasted**.
+- Re-pasting the same screenshot does not upload it again; temporary screenshots uploaded during the session are deleted from the remote host on exit, mirroring the local `temp/` cleanup.
+- Files copied in Explorer are uploaded the same way and their remote paths are pasted (directories are not supported).
 
 ### ⌨️ IME guard strategies
 
@@ -427,6 +508,10 @@ Since v4.1.3 the helper performs no keyboard-layout work at startup, resolves th
 
 If an earlier version already left English (United States) in your language list, remove it once under `Settings → Time & language → Language & region`; the new build will not add it back.
 
+**Q6: I run Codex on a remote server over SSH — can I still paste images?** ([issue #11](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/11))
+
+Yes, since v4.2, with no configuration: on each hotkey press the helper finds the SSH session you currently have open (whether started from the Windows side or from inside WSL), uploads the image with the same SSH arguments and pastes the remote path. The only prerequisite is key-based passwordless login to that host (the helper has no console to type a password); if you log in with a password today, add your public key to the remote `~/.ssh/authorized_keys` once per host. See "Remote paste over SSH" above.
+
 If you prefer building from source:
 
 1. Clone repository:
@@ -459,6 +544,7 @@ cargo clean
 
 ### 🕒 Version Line
 
+- `v4.2`: remote paste over SSH — auto-detects the open SSH session (Windows-side `ssh.exe` or WSL-side `ssh`), uploads the image with the same SSH arguments and pastes the remote path; tray auto/off/pin switch and remote cleanup on exit (#11)
 - `v4.1.3`: no more phantom `ENG` keyboard layout on startup — lazy English-layout resolution plus the new `ime_protection` setting (#10)
 - `v4.1.2`: dismiss the target window's menu mode (fast Alt release) before injecting Ctrl+V so pastes are not swallowed
 - `v4.1.1`: treat all-zero alpha in 32-bit clipboard DIBs as opaque so saved PNGs are not fully transparent

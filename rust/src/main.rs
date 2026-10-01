@@ -3,18 +3,22 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 mod clipboard;
 mod cleanup;
 mod config;
+mod foreground;
 mod hotkey;
 mod image_saver;
 mod paste;
+mod remote;
 mod tray;
 
 use clipboard::ClipboardManager;
 use config::{ImeProtection, PathStyle, RuntimeMode};
+use remote::{RemoteMode, RemoteUploader, SshSession};
 use tray::TrayCommand;
 
 /// 应用运行时状态（可被托盘命令修改）
@@ -22,13 +26,35 @@ struct AppState {
     runtime_mode: RuntimeMode,
     path_style: PathStyle,
     ime_protection: ImeProtection,
+    /// 远程粘贴模式（issue #11）
+    remote: RemoteMode,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    // 显式诊断启动才落盘；普通启动不记录日志，也不改变用户配置。
+    if std::env::args().any(|arg| arg == "--diagnostics") {
+        let exe = std::env::current_exe()?;
+        let path = exe.with_file_name(format!("wsl_clipboard-diagnostic-{}.log", std::process::id()));
+        let file = std::fs::OpenOptions::new().create_new(true).write(true).open(&path)?;
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init();
+        info!(exe = %exe.display(), pid = std::process::id(), "诊断模式启动");
+    } else {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .init();
+    }
+
+    // 重复双击 exe 时不再多开：后开的实例抢不到热键，只会在托盘里多出一个没用的图标
+    let Some(_instance_guard) = acquire_single_instance() else {
+        info!("已有实例在运行，退出");
+        notify_already_running();
+        return Ok(());
+    };
 
     info!(
         "WSL Clipboard Helper v{} (Rust) 启动中...",
@@ -38,10 +64,11 @@ async fn main() -> Result<()> {
     // 加载配置
     let app_config = config::AppConfig::load().unwrap_or_default();
     info!(
-        "加载配置: 热键={}, 模式={:?}, 输入法保护={}",
+        "加载配置: 热键={}, 模式={:?}, 输入法保护={}, 远程粘贴={}",
         app_config.hotkey,
         app_config.runtime_mode,
-        app_config.ime_protection.as_str()
+        app_config.ime_protection.as_str(),
+        if app_config.remote_paste { "自动" } else { "关闭" }
     );
 
     // 确定临时目录
@@ -62,11 +89,15 @@ async fn main() -> Result<()> {
     // 创建剪贴板管理器
     let clipboard_manager = ClipboardManager::new(temp_dir.clone());
 
+    // 远程上传器（issue #11）
+    let remote_uploader = RemoteUploader::new();
+
     // 运行时状态
     let state = Arc::new(Mutex::new(AppState {
         runtime_mode: app_config.runtime_mode.clone(),
         path_style: app_config.path_style,
         ime_protection: app_config.ime_protection,
+        remote: RemoteMode::from_config(app_config.remote_paste),
     }));
 
     // 启动托盘（含热键管理器）
@@ -109,11 +140,24 @@ async fn main() -> Result<()> {
         tokio::select! {
             // 热键触发
             Some(_hotkey_id) = hotkey_rx.recv() => {
-                let (mode, path_style, ime_protection) = {
+                let (mode, path_style, ime_protection, remote_mode) = {
                     let s = state.lock().await;
-                    (s.runtime_mode.clone(), s.path_style, s.ime_protection)
+                    (s.runtime_mode.clone(), s.path_style, s.ime_protection, s.remote.clone())
                 };
-                match handle_paste(&clipboard_manager, &mode, path_style, ime_protection).await {
+                // 枚举 ssh 进程要走进程快照 / 起 wsl.exe（约 0.2 秒），再探测前台 tab，放到阻塞线程上
+                // 与读剪贴板、落盘并行，只在真正要决定粘什么路径时才等它
+                info!(remote_mode = %remote_mode.display_name(), "收到图片粘贴热键");
+                let session = tokio::task::spawn_blocking(move || remote_mode.resolve());
+                match handle_paste(
+                    &clipboard_manager,
+                    &remote_uploader,
+                    &mode,
+                    path_style,
+                    ime_protection,
+                    session,
+                )
+                .await
+                {
                     Ok(_) => {}
                     Err(e) => {
                         error!("粘贴处理失败: {}", e);
@@ -141,6 +185,11 @@ async fn main() -> Result<()> {
                         let mut s = state.lock().await;
                         s.ime_protection = policy;
                     }
+                    TrayCommand::SwitchRemoteMode(mode) => {
+                        info!("主循环: 远程粘贴已切换为 {}", mode.display_name());
+                        let mut s = state.lock().await;
+                        s.remote = mode;
+                    }
                     TrayCommand::OpenFolder => {
                         if let Err(e) = tray::open_temp_folder() {
                             error!("打开文件夹失败: {}", e);
@@ -164,6 +213,9 @@ async fn main() -> Result<()> {
         warn!("退出清理临时文件失败: {}", e);
     }
 
+    // 本会话上传到远程的临时截图也一并删掉（issue #11）
+    remote_uploader.cleanup_on_exit().await;
+
     // 若本进程曾惰性加载过英文键盘布局（ime_protection = "layout-force"），
     // 退出时卸载掉，不在用户的输入法切换列表里留下残留（issue #10）
     paste::unload_self_loaded_layout();
@@ -172,21 +224,85 @@ async fn main() -> Result<()> {
     std::process::exit(0);
 }
 
+/// 单实例保护：持有一个会话内的命名 mutex，进程退出时由系统释放。
+/// 返回 None 表示已有实例在运行
+fn acquire_single_instance() -> Option<windows::Win32::Foundation::HANDLE> {
+    use windows::core::w;
+    use windows::core::Error;
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    unsafe {
+        match CreateMutexW(None, true, w!("Local\\WSLImageClipboardHelper.SingleInstance")) {
+            Ok(handle) if Error::from_win32().code() == ERROR_ALREADY_EXISTS.to_hresult() => {
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
+                None
+            }
+            Ok(handle) => Some(handle),
+            // 已有实例以管理员身份运行时，普通权限打不开它的 mutex
+            Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => None,
+            // 其他失败不应挡住启动
+            Err(e) => {
+                warn!("创建单实例 mutex 失败，跳过单实例检查: {}", e);
+                Some(windows::Win32::Foundation::HANDLE::default())
+            }
+        }
+    }
+}
+
+fn notify_already_running() {
+    use windows::core::w;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+
+    unsafe {
+        MessageBoxW(
+            None,
+            w!("WSL Clipboard Helper 已经在运行了，请在任务栏右下角的托盘区找它的图标。"),
+            w!("WSL Clipboard Helper"),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
 /// 处理粘贴操作
 async fn handle_paste(
     clipboard_manager: &ClipboardManager,
+    uploader: &RemoteUploader,
     mode: &RuntimeMode,
     path_style: PathStyle,
     ime_protection: ImeProtection,
+    session: JoinHandle<Option<SshSession>>,
 ) -> Result<()> {
     // 0. 立即注入菜单屏蔽键：赶在物理 Alt 抬起之前，
     //    避免目标窗口把"Alt 按下→抬起"当成单击 Alt 激活菜单栏
     paste::mask_alt_tap();
 
-    // 1. 检查剪贴板是否有图片
-    if !clipboard_manager.has_image() {
+    // 1. 真实图片或本程序为上一张图片写入的路径，都进入图片处理链
+    let image = if clipboard_manager.has_image() {
+        Some(clipboard_manager.read_image_for_paste()
+            .ok_or_else(|| anyhow::anyhow!("读取剪贴板图片失败"))?)
+    } else {
+        clipboard_manager.read_own_image_text()?
+    };
+    let Some(image) = image else {
         if clipboard_manager.has_file_list() {
-            if let Some(wsl_paths) = clipboard_manager.read_file_list_for_paste() {
+            let remote = session.await.unwrap_or(None);
+            let paths = match remote.as_ref() {
+                // 发现了 ssh 会话：Explorer 里复制的文件同样上传过去，粘贴远程路径
+                Some(target) => match clipboard_manager.read_file_list_raw() {
+                    Some(win_paths) => match upload_file_list(uploader, target, &win_paths).await {
+                        Ok(remote_paths) => Some(remote_paths),
+                        Err(e) => {
+                            report_remote_failure(target, &e);
+                            return Ok(());
+                        }
+                    },
+                    None => None,
+                },
+                None => clipboard_manager.read_file_list_for_paste(),
+            };
+
+            if let Some(wsl_paths) = paths {
                 let paste_text = path_style.format_paths(&wsl_paths);
 
                 let _ime_guard = match mode {
@@ -203,19 +319,27 @@ async fn handle_paste(
         info!("剪贴板无图片，执行普通粘贴");
         paste::send_ctrl_v()?;
         return Ok(());
-    }
+    };
 
-    info!("检测到剪贴板图片");
-
-    // 2. 读取图片（含缓存）
-    let (win_path, wsl_path, png_data) = clipboard_manager
-        .read_image_for_paste()
-        .ok_or_else(|| anyhow::anyhow!("读取剪贴板图片失败"))?;
+    let clipboard::PasteImage { source_seq, win_path, wsl_path, png_data } = image;
 
     // 3. 先落盘再粘贴：CLI 收到路径的瞬间会检查文件是否存在，
     //    决定渲染成 [Image #n] 还是留下原始路径文本（issue #4）
     info!("保存图片: {} bytes → {}", png_data.len(), win_path.display());
     image_saver::ensure_saved(&win_path, &png_data).await?;
+
+    // 3b. 发现了 ssh 会话（issue #11）：先把图片 ssh 上传到远程，再粘贴远程路径；
+    //     上传失败时不粘贴任何内容——本地 /mnt 路径在远程终端里没有意义
+    let paste_path = match session.await.unwrap_or(None) {
+        Some(target) => match uploader.upload(&target, &win_path, true).await {
+            Ok(remote_path) => remote_path,
+            Err(e) => {
+                report_remote_failure(&target, &e);
+                return Ok(());
+            }
+        },
+        None => wsl_path,
+    };
 
     // 4. 输入法保护（仅安全模式，且由 ime_protection 策略决定具体手段）
     let _ime_guard = match mode {
@@ -223,12 +347,50 @@ async fn handle_paste(
         RuntimeMode::Fast => None,
     };
 
-    // 5. 粘贴 WSL 路径
-    let paste_text = path_style.format_paths(std::slice::from_ref(&wsl_path));
+    // 5. 粘贴路径（本地 WSL 路径或远程路径）
+    let paste_text = path_style.format_paths(std::slice::from_ref(&paste_path));
     info!("粘贴路径: {}", paste_text);
-    paste::paste_text(&paste_text)?;
+    let Some(written_seq) = paste::write_text(&paste_text, Some(source_seq))? else {
+        info!("图片处理期间剪贴板已变化，取消本次粘贴");
+        return Ok(());
+    };
+    clipboard_manager.record_image_text(source_seq, written_seq, &paste_text);
+    paste::send_ctrl_v()?;
 
     // 6. ImeGuard 在此处 drop，触发 120ms 后恢复输入法
 
     Ok(())
+}
+
+/// 把 Explorer 复制的文件逐个上传到远程（跳过目录），返回远程路径列表
+async fn upload_file_list(
+    uploader: &RemoteUploader,
+    target: &SshSession,
+    win_paths: &[String],
+) -> Result<Vec<String>> {
+    let mut remote_paths = Vec::with_capacity(win_paths.len());
+    for p in win_paths {
+        let path = std::path::Path::new(p);
+        if path.is_dir() {
+            warn!("远程粘贴跳过目录: {}", p);
+            continue;
+        }
+        remote_paths.push(uploader.upload(target, path, false).await?);
+    }
+    if remote_paths.is_empty() {
+        anyhow::bail!("没有可上传的文件（不支持目录）");
+    }
+    Ok(remote_paths)
+}
+
+/// 远程上传失败：程序没有窗口，光写日志用户看不到，用托盘气泡告知原因。
+/// 最常见的原因是远程没有本机公钥（新连接无法免密），顺带提示怎么配
+fn report_remote_failure(session: &SshSession, err: &anyhow::Error) {
+    error!("远程上传失败 ({}): {:#}", session.label(), err);
+    let text = format!(
+        "[{}] {:#}\n若为认证失败：请先 ssh-copy-id 或把本机公钥加入远程 ~/.ssh/authorized_keys，\
+         或在托盘「远程粘贴（SSH）」里选择关闭",
+        session.destination, err
+    );
+    tray::notify_warning("远程粘贴失败", &text);
 }

@@ -58,6 +58,39 @@ Language: [中文说明](#中文说明) | [English Version](#english-version)
     └─→ 延时恢复原输入法布局
 ```
 
+#### 远程粘贴流程（v4.2，Rust 版，issue #11）
+
+远程粘贴默认开启且无需配置。图片落盘之后、粘贴之前多出"发现 ssh 会话 + 上传"两步（会话枚举与落盘并行）：
+
+```
+热键按下
+    ├─→ [阻塞线程] 枚举 ssh 会话
+    │       Windows: Toolhelp 快照找 ssh.exe → NtQueryInformationProcess(ProcessCommandLineInformation) 读命令行
+    │       WSL:     wsl.exe --list --running 非空时，wsl.exe -e sh -c 'ps -o pid=,etimes=,args= -C ssh | …'（顺带读每个 ssh 的 WT_SESSION）
+    │       解析 ssh 参数：剔除远程命令 / 端口转发 / tty 类选项，只保留认证与路由相关参数
+    │       过滤非交互会话（-N / -T / -f / -W / -O，或带远程命令但无 -t），按启动时间倒序
+    │       判断会话是否在前台 tab（foreground.rs）：
+    │         AttachConsole 到 ssh.exe（WSL 会话则到 WT_SESSION 相同的 wsl.exe）取控制台窗口
+    │         前台是 WT：给窗口内各 tab 的控制台标题追加不同个数的零宽空格，看窗口标题变成哪个即活动 tab，随即还原
+    │         前台是经典 conhost：前台窗口即控制台；判断不出具体 tab 时退回“前台程序里最近打开的会话”
+    │
+图片已写入 temp/
+    │
+    ├─→ 前台 tab 里没有会话（或托盘选了关闭）──→ 粘贴本地 /mnt 路径
+    │
+    ├─→ 会话内已上传过同一文件？ ──是──→ 复用远程路径
+    │                │否
+    ├─→ 用发现到的 ssh（Windows: 同一个 ssh.exe / WSL: wsl.exe -e ssh）+ 同一份参数新建连接，本地文件作为 stdin
+    │       远程执行 mkdir -p DIR && cat > DIR/FILE && printf '%s\n' DIR/FILE
+    │       DIR = /tmp/wsl_clipboard-"$(id -u)"
+    │
+    ├─→ 读取回显的绝对路径
+    │
+    └─→ 粘贴远程路径；失败则托盘气泡提示（含公钥配置提示）、不粘贴
+```
+
+ssh 以 `BatchMode=yes`、`ConnectTimeout=5`、`LogLevel=ERROR` 运行，整体 60 秒超时；子进程以 `CREATE_NO_WINDOW` 启动避免闪出控制台。托盘菜单可切换自动 / 关闭（持久化为 `remote_paste`）或固定某个会话。退出时对本会话上传的临时截图执行 `rm -f`。相关代码见 `rust/src/remote.rs`、`rust/src/foreground.rs`。
+
 #### 路径转换策略
 
 ```ahk
@@ -166,6 +199,41 @@ Press Alt+V
     │
     └─→ Restore the original input method after a short delay
 ```
+
+#### Remote Paste Sequence (v4.2, Rust, issue #11)
+
+Remote paste is on by default and needs no configuration. Between writing the image and pasting, the helper discovers the open SSH session (in parallel with the disk write) and uploads:
+
+```
+Hotkey pressed
+    ├─→ [blocking thread] enumerate SSH sessions
+    │       Windows: Toolhelp snapshot → ssh.exe → NtQueryInformationProcess(ProcessCommandLineInformation)
+    │       WSL:     if `wsl.exe --list --running` is non-empty: wsl.exe -e sh -c 'ps -o pid=,etimes=,args= -C ssh | …' (also reads each ssh's WT_SESSION)
+    │       parse ssh args: drop remote command / port forwards / tty flags, keep auth & routing options
+    │       skip non-interactive ones (-N / -T / -f / -W / -O, or a remote command without -t); newest first
+    │       keep only sessions in the foreground tab (foreground.rs):
+    │         AttachConsole to ssh.exe (for WSL sessions: the wsl.exe with the same WT_SESSION) to get its console window
+    │         foreground is WT: append a different number of zero-width spaces to each tab's console title,
+    │           the one the window title picks up is the active tab; restore right away
+    │         foreground is classic conhost: that window is the console; if the tab can't be determined,
+    │           fall back to the newest session in the foreground app
+    │
+Image written to temp/
+    │
+    ├─→ no session in the foreground tab (or tray set to off) ──→ paste local /mnt path
+    │
+    ├─→ Already uploaded in this session? ──yes──→ reuse remote path
+    │                │no
+    ├─→ Spawn the discovered ssh (Windows: same ssh.exe / WSL: wsl.exe -e ssh) with the same args, local file as stdin
+    │       remote: mkdir -p DIR && cat > DIR/FILE && printf '%s\n' DIR/FILE
+    │       DIR = /tmp/wsl_clipboard-"$(id -u)"
+    │
+    ├─→ Read back the echoed absolute path
+    │
+    └─→ Paste the remote path; on failure show a tray balloon (with a public-key hint) and paste nothing
+```
+
+SSH runs with `BatchMode=yes`, `ConnectTimeout=5`, `LogLevel=ERROR` and a 60 s overall timeout; the child process is started with `CREATE_NO_WINDOW` so no console flashes. The tray submenu switches auto / off (persisted as `remote_paste`) or pins one session. On exit, temporary screenshots uploaded during the session are removed with `rm -f`. See `rust/src/remote.rs` and `rust/src/foreground.rs`.
 
 #### Path Conversion Strategy
 

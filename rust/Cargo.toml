@@ -1,6 +1,6 @@
 [package]
 name = "wsl_clipboard"
-version = "4.1.3"
+version = "4.2.0"
 edition = "2021"
 description = "WSL CLI Clipboard Helper - Fast image paste for AI agents"
 authors = ["liu"]
@@ -22,6 +22,14 @@ windows = { version = "=0.52", features = [
     "Win32_System_Memory",
     "Win32_UI_Shell_Common",
     "Win32_UI_Input_Pointer",
+    # 远程粘贴：枚举 ssh.exe 进程并读取其命令行（issue #11）
+    "Win32_System_Diagnostics_ToolHelp",
+    "Wdk_System_Threading",
+    # 判断 ssh 会话是否在前台终端 tab 里：AttachConsole / 控制台标题、读 wsl.exe 的环境块
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    # 单实例：CreateMutexW（参数含 SECURITY_ATTRIBUTES）
+    "Win32_Security",
 ] }
 
 # 全局热键
