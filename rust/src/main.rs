@@ -6,14 +6,16 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-mod clipboard;
 mod cleanup;
+mod clipboard;
 mod config;
 mod foreground;
 mod hotkey;
 mod image_saver;
 mod paste;
 mod remote;
+mod remote_transport;
+mod ssh_auth;
 mod tray;
 
 use clipboard::ClipboardManager;
@@ -32,11 +34,20 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Some(code) = ssh_auth::handle_askpass() {
+        std::process::exit(code);
+    }
     // 显式诊断启动才落盘；普通启动不记录日志，也不改变用户配置。
     if std::env::args().any(|arg| arg == "--diagnostics") {
         let exe = std::env::current_exe()?;
-        let path = exe.with_file_name(format!("wsl_clipboard-diagnostic-{}.log", std::process::id()));
-        let file = std::fs::OpenOptions::new().create_new(true).write(true).open(&path)?;
+        let path = exe.with_file_name(format!(
+            "wsl_clipboard-diagnostic-{}.log",
+            std::process::id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)?;
         tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
             .with_ansi(false)
@@ -68,7 +79,11 @@ async fn main() -> Result<()> {
         app_config.hotkey,
         app_config.runtime_mode,
         app_config.ime_protection.as_str(),
-        if app_config.remote_paste { "自动" } else { "关闭" }
+        if app_config.remote_paste {
+            "自动"
+        } else {
+            "关闭"
+        }
     );
 
     // 确定临时目录
@@ -87,10 +102,10 @@ async fn main() -> Result<()> {
     // 且默认只复用系统已有布局，详见 config::ImeProtection。
 
     // 创建剪贴板管理器
-    let clipboard_manager = ClipboardManager::new(temp_dir.clone());
+    let clipboard_manager = Arc::new(ClipboardManager::new(temp_dir.clone()));
 
     // 远程上传器（issue #11）
-    let remote_uploader = RemoteUploader::new();
+    let remote_uploader = Arc::new(RemoteUploader::new());
 
     // 运行时状态
     let state = Arc::new(Mutex::new(AppState {
@@ -105,16 +120,14 @@ async fn main() -> Result<()> {
 
     // 将 std mpsc 桥接到 tokio mpsc，以便在 select! 中使用
     let (tray_tx_bridge, mut tray_rx) = mpsc::channel::<TrayCommand>(32);
-    tokio::task::spawn_blocking(move || {
-        loop {
-            match std_tray_rx.recv() {
-                Ok(cmd) => {
-                    if tray_tx_bridge.blocking_send(cmd).is_err() {
-                        break;
-                    }
+    tokio::task::spawn_blocking(move || loop {
+        match std_tray_rx.recv() {
+            Ok(cmd) => {
+                if tray_tx_bridge.blocking_send(cmd).is_err() {
+                    break;
                 }
-                Err(_) => break,
             }
+            Err(_) => break,
         }
     });
 
@@ -135,11 +148,14 @@ async fn main() -> Result<()> {
 
     info!("WSL Clipboard Helper 已启动");
 
+    let mut paste_task: Option<JoinHandle<Result<()>>> = None;
     // 主事件循环
     loop {
         tokio::select! {
             // 热键触发
             Some(_hotkey_id) = hotkey_rx.recv() => {
+                // Keep the tray responsive during authentication, without queuing dialogs.
+                if paste_task.is_some() { continue; }
                 let (mode, path_style, ime_protection, remote_mode) = {
                     let s = state.lock().await;
                     (s.runtime_mode.clone(), s.path_style, s.ime_protection, s.remote.clone())
@@ -148,20 +164,23 @@ async fn main() -> Result<()> {
                 // 与读剪贴板、落盘并行，只在真正要决定粘什么路径时才等它
                 info!(remote_mode = %remote_mode.display_name(), "收到图片粘贴热键");
                 let session = tokio::task::spawn_blocking(move || remote_mode.resolve());
-                match handle_paste(
-                    &clipboard_manager,
-                    &remote_uploader,
-                    &mode,
-                    path_style,
-                    ime_protection,
-                    session,
-                )
-                .await
-                {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("粘贴处理失败: {}", e);
-                    }
+                let clipboard = clipboard_manager.clone();
+                let uploader = remote_uploader.clone();
+                paste_task = Some(tokio::spawn(async move {
+                    handle_paste(&clipboard, &uploader, &mode, path_style, ime_protection, session).await
+                }));
+            }
+            result = async {
+                match &mut paste_task {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            }, if paste_task.is_some() => {
+                paste_task = None;
+                match result {
+                    Ok(Ok(())) => {},
+                    Ok(Err(e)) => error!("粘贴处理失败: {}", e),
+                    Err(e) => error!("粘贴任务已中止: {}", e),
                 }
             }
             // 托盘命令
@@ -208,6 +227,10 @@ async fn main() -> Result<()> {
         }
     }
 
+    if let Some(task) = paste_task {
+        task.abort();
+        let _ = task.await; // Drop authentication guards before cleaning up channels.
+    }
     // 退出前清理 temp 目录下的所有 PNG 文件
     if let Err(e) = cleanup::cleanup_temp_png(&temp_dir) {
         warn!("退出清理临时文件失败: {}", e);
@@ -233,7 +256,11 @@ fn acquire_single_instance() -> Option<windows::Win32::Foundation::HANDLE> {
     use windows::Win32::System::Threading::CreateMutexW;
 
     unsafe {
-        match CreateMutexW(None, true, w!("Local\\WSLImageClipboardHelper.SingleInstance")) {
+        match CreateMutexW(
+            None,
+            true,
+            w!("Local\\WSLImageClipboardHelper.SingleInstance"),
+        ) {
             Ok(handle) if Error::from_win32().code() == ERROR_ALREADY_EXISTS.to_hresult() => {
                 let _ = windows::Win32::Foundation::CloseHandle(handle);
                 None
@@ -273,19 +300,25 @@ async fn handle_paste(
     ime_protection: ImeProtection,
     session: JoinHandle<Option<SshSession>>,
 ) -> Result<()> {
+    let paste_window = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
     // 0. 立即注入菜单屏蔽键：赶在物理 Alt 抬起之前，
     //    避免目标窗口把"Alt 按下→抬起"当成单击 Alt 激活菜单栏
     paste::mask_alt_tap();
 
     // 1. 真实图片或本程序为上一张图片写入的路径，都进入图片处理链
     let image = if clipboard_manager.has_image() {
-        Some(clipboard_manager.read_image_for_paste()
-            .ok_or_else(|| anyhow::anyhow!("读取剪贴板图片失败"))?)
+        Some(
+            clipboard_manager
+                .read_image_for_paste()
+                .ok_or_else(|| anyhow::anyhow!("读取剪贴板图片失败"))?,
+        )
     } else {
         clipboard_manager.read_own_image_text()?
     };
     let Some(image) = image else {
         if clipboard_manager.has_file_list() {
+            let file_source_seq =
+                unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
             let remote = session.await.unwrap_or(None);
             let paths = match remote.as_ref() {
                 // 发现了 ssh 会话：Explorer 里复制的文件同样上传过去，粘贴远程路径
@@ -303,6 +336,9 @@ async fn handle_paste(
             };
 
             if let Some(wsl_paths) = paths {
+                if !still_in_paste_window(paste_window) {
+                    return Ok(());
+                }
                 let paste_text = path_style.format_paths(&wsl_paths);
 
                 let _ime_guard = match mode {
@@ -311,7 +347,9 @@ async fn handle_paste(
                 };
 
                 info!("粘贴文件路径: {}", paste_text);
-                paste::paste_text(&paste_text)?;
+                if paste::write_text(&paste_text, Some(file_source_seq))?.is_some() {
+                    paste::send_ctrl_v()?;
+                }
                 return Ok(());
             }
         }
@@ -321,11 +359,20 @@ async fn handle_paste(
         return Ok(());
     };
 
-    let clipboard::PasteImage { source_seq, win_path, wsl_path, png_data } = image;
+    let clipboard::PasteImage {
+        source_seq,
+        win_path,
+        wsl_path,
+        png_data,
+    } = image;
 
     // 3. 先落盘再粘贴：CLI 收到路径的瞬间会检查文件是否存在，
     //    决定渲染成 [Image #n] 还是留下原始路径文本（issue #4）
-    info!("保存图片: {} bytes → {}", png_data.len(), win_path.display());
+    info!(
+        "保存图片: {} bytes → {}",
+        png_data.len(),
+        win_path.display()
+    );
     image_saver::ensure_saved(&win_path, &png_data).await?;
 
     // 3b. 发现了 ssh 会话（issue #11）：先把图片 ssh 上传到远程，再粘贴远程路径；
@@ -342,6 +389,9 @@ async fn handle_paste(
     };
 
     // 4. 输入法保护（仅安全模式，且由 ime_protection 策略决定具体手段）
+    if !still_in_paste_window(paste_window) {
+        return Ok(());
+    }
     let _ime_guard = match mode {
         RuntimeMode::Safe => Some(paste::ImeGuard::new(ime_protection)),
         RuntimeMode::Fast => None,
@@ -384,13 +434,19 @@ async fn upload_file_list(
 }
 
 /// 远程上传失败：程序没有窗口，光写日志用户看不到，用托盘气泡告知原因。
-/// 最常见的原因是远程没有本机公钥（新连接无法免密），顺带提示怎么配
 fn report_remote_failure(session: &SshSession, err: &anyhow::Error) {
     error!("远程上传失败 ({}): {:#}", session.label(), err);
     let text = format!(
-        "[{}] {:#}\n若为认证失败：请先 ssh-copy-id 或把本机公钥加入远程 ~/.ssh/authorized_keys，\
-         或在托盘「远程粘贴（SSH）」里选择关闭",
+        "[{}] {:#}\n若取消认证或连接断开，可回到原终端再次按热键重试。",
         session.destination, err
     );
     tray::notify_warning("远程粘贴失败", &text);
+}
+
+fn still_in_paste_window(original: windows::Win32::Foundation::HWND) -> bool {
+    if unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() } == original {
+        return true;
+    }
+    tray::notify_warning("已暂停粘贴", "当前窗口已变化，请回到原终端再次按热键粘贴。");
+    false
 }

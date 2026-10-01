@@ -1,5 +1,5 @@
 //! 远程粘贴（issue #11）：自动发现当前打开的 ssh 会话，把本地文件用同一份 ssh 参数
-//! 上传到远程主机，返回远程路径。用户不需要任何配置。
+//! 上传到远程主机，返回远程路径；按需认证并保持上传连接。
 //!
 //! 发现：枚举 Windows 侧的 `ssh.exe` 进程（读取命令行）和 WSL 默认发行版里的 `ssh`
 //! 进程，只保留交互式登录会话（排除 `-N` 隧道、`-T`/VS Code Remote、`-W`/`-O` 等）。
@@ -7,36 +7,30 @@
 //! 同一个 Windows Terminal 里本地 tab 和 ssh tab 并存时，在本地 tab 按热键仍粘本地路径。
 //! 托盘菜单可手动固定某个会话。
 //!
-//! 传输：只用一条 ssh 连接完成"建目录 + 写文件 + 回显绝对路径"：远程执行
-//! `mkdir -p DIR && cat > DIR/FILE && printf '%s\n' DIR/FILE`，本地文件作为 ssh 的
-//! stdin 流式送过去。不依赖远程装有 scp / sftp-server。
-//!
-//! 认证：程序没有控制台，无法输入密码，因此新建的 ssh 连接必须能免密登录
-//! （公钥认证）。这是所有"独立进程上传"方案共同的前提。
+//! 传输：保持专用的非交互 SSH channel，通过带长度的协议连续上传文件。
+//! 认证：先尝试现有密钥 / agent / WSL ControlPath；需要时用原生 askpass 窗口。
+//! 密码不落盘；退出只关闭已有连接，由远程 shell 清理临时截图。
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::Result;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::foreground::{self, Anchor, Focus};
 
-/// 单次上传（含建连）的最长等待
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
-/// 退出清理的最长等待，不能拖住退出流程
-const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// 给用户输入密码/口令的时间；连接建立后另有传输超时。
+const AUTH_TIMEOUT: Duration = Duration::from_secs(180);
+/// 首次静默认证（包含跳板）的最长等待。
+const SILENT_AUTH_TIMEOUT: Duration = Duration::from_secs(20);
 /// ssh 建连超时（秒），主机不可达时尽快失败
 const CONNECT_TIMEOUT_SECS: u32 = 5;
 /// CREATE_NO_WINDOW：本程序是无控制台的 GUI 进程，
 /// 不加该标志启动 ssh.exe / wsl.exe 会闪出一个黑色控制台窗口
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-/// 远程存放目录（shell 表达式）：按 uid 区分，避免多人共用一台主机时 /tmp 下目录归属冲突
-const REMOTE_DIR_EXPR: &str = "/tmp/wsl_clipboard-\"$(id -u)\"";
-
 /// ssh 客户端来自哪一侧：别名、密钥、known_hosts 都只在那一侧存在，
 /// 上传必须复用发现到会话的那一侧
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,16 +65,31 @@ pub struct SshSession {
     started: u64,
     /// WSL 侧：会话所在 Windows Terminal tab 的 WT_SESSION，用来对应到该 tab 的 wsl.exe
     wt_session: Option<String>,
+    wsl_context: Option<(String, String)>,
+    cwd: Option<String>,
+    auth_sock: Option<String>,
 }
 
 impl SshSession {
+    fn wsl_prefix(&self) -> Vec<String> {
+        match &self.wsl_context {
+            Some((distro, user)) => vec!["-d".into(), distro.clone(), "-u".into(), user.clone()],
+            None => Vec::new(),
+        }
+    }
+
     pub fn label(&self) -> String {
         format!("{}  ({})", self.destination, self.backend.display_name())
     }
 
     /// 是否指向同一目标。忽略 pid：同一个 tab 断线重连后仍视为同一目标
     pub fn same_target(&self, other: &SshSession) -> bool {
-        self.backend == other.backend && self.args == other.args
+        self.backend == other.backend
+            && self.program == other.program
+            && self.args == other.args
+            && self.wsl_context == other.wsl_context
+            && self.cwd == other.cwd
+            && self.auth_sock == other.auth_sock
     }
 }
 
@@ -104,7 +113,7 @@ pub enum RemoteMode {
     /// 前台 tab 里有 ssh 会话就上传到它，否则粘贴本地路径
     Auto,
     /// 固定上传到指定会话，不看前台；该会话已关闭时退回 Auto 的行为
-    Pinned(SshSession),
+    Pinned(Box<SshSession>),
 }
 
 impl RemoteMode {
@@ -145,9 +154,16 @@ impl RemoteMode {
         let anchors = anchors_of(&sessions, &procs);
         let focus = foreground::classify(&anchors, &procs);
         for ((session, anchor), focus) in sessions.iter().zip(&anchors).zip(&focus) {
-            let anchor_pid = match anchor { Anchor::Process(pid) => Some(*pid), Anchor::AnyWsl => None };
-            info!(ssh_pid = session.pid, ?anchor_pid, ?focus,
-                "SSH 会话与前台 tab 的匹配结果");
+            let anchor_pid = match anchor {
+                Anchor::Process(pid) => Some(*pid),
+                Anchor::AnyWsl => None,
+            };
+            info!(
+                ssh_pid = session.pid,
+                ?anchor_pid,
+                ?focus,
+                "SSH 会话与前台 tab 的匹配结果"
+            );
         }
         let chosen = pick(sessions, &focus);
         match &chosen {
@@ -338,7 +354,11 @@ unsafe fn inspect_windows_process(pid: u32) -> Option<SshSession> {
             0
         };
 
-        session_from_argv(SshBackend::Windows, pid, program, argv.get(1..)?, started)
+        let mut session =
+            session_from_argv(SshBackend::Windows, pid, program, argv.get(1..)?, started)?;
+        session.auth_sock = foreground::env_var(pid, "SSH_AUTH_SOCK");
+        session.cwd = foreground::process_directory(pid);
+        Some(session)
     })();
 
     let _ = CloseHandle(handle);
@@ -356,10 +376,22 @@ fn filetime_to_unix(ft: windows::Win32::Foundation::FILETIME) -> u64 {
     (ticks / 10_000_000).saturating_sub(11_644_473_600)
 }
 
-/// 列出 WSL 里的 ssh 进程：每行 `pid WT_SESSION etimes args...`（无 WT_SESSION 时为 `-`）。
+/// WSL 进程记录以 RS 分隔，环境字段和 argv 以 NUL 分隔，保留参数中的空格。
 /// 在 tmux / screen 里的 ssh 不报 WT_SESSION：它继承的是 tmux 服务端启动时那个 tab 的值，
 /// 不代表用户现在从哪个 tab 看它
-const WSL_PS_SCRIPT: &str = r#"ps -o pid=,etimes=,args= -C ssh | while read -r pid rest; do e=$(tr '\0' '\n' < /proc/$pid/environ 2>/dev/null); wt=$(printf '%s\n' "$e" | sed -n 's/^WT_SESSION=//p'); printf '%s\n' "$e" | grep -q -e '^TMUX=' -e '^STY=' && wt=; echo "$pid ${wt:--} $rest"; done"#;
+const WSL_PS_SCRIPT: &str = r#"uid=$(id -u); user=$(id -un)
+ps -o uid=,pid=,etimes= -C ssh | while read -r owner pid elapsed; do
+    [ "$owner" = "$uid" ] || continue
+    [ -r "/proc/$pid/cmdline" ] || continue
+    e=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null) || continue
+    wt=$(printf '%s\n' "$e" | sed -n 's/^WT_SESSION=//p')
+    printf '%s\n' "$e" | grep -q -e '^TMUX=' -e '^STY=' && wt=
+    sock=$(printf '%s\n' "$e" | sed -n 's/^SSH_AUTH_SOCK=//p')
+    cwd=$(readlink "/proc/$pid/cwd") || continue
+    exe=$(readlink "/proc/$pid/exe") || continue
+    printf '\036%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0' "$pid" "$wt" "$elapsed" "$WSL_DISTRO_NAME" "$user" "$cwd" "$sock" "$exe"
+    cat "/proc/$pid/cmdline"
+done"#;
 
 /// WSL 侧：默认发行版正在运行时，用 ps 列出其中的 ssh 进程
 fn discover_wsl() -> Vec<SshSession> {
@@ -394,25 +426,35 @@ fn wsl_is_running() -> bool {
     !String::from_utf16_lossy(&wide).trim().is_empty()
 }
 
-/// 解析 [`WSL_PS_SCRIPT`] 的输出。args 只按空白切分：
-/// 交互式 ssh 命令行里几乎不会出现带引号的参数
+/// NUL-separated argv preserves spaces in identity/config paths. Record separator is RS.
 fn parse_ps_output(text: &str, now: u64) -> Vec<SshSession> {
-    text.lines()
-        .filter_map(|line| {
-            let mut it = line.split_whitespace();
-            let pid: u32 = it.next()?.parse().ok()?;
-            let wt_session = Some(it.next()?).filter(|s| *s != "-").map(str::to_string);
-            let elapsed: u64 = it.next()?.parse().ok()?;
-            // 第一个 token 是 ssh 程序本身
-            let argv: Vec<String> = it.skip(1).map(str::to_string).collect();
+    text.split('\u{1e}')
+        .filter_map(|record| {
+            let mut fields = record.split('\0');
+            let pid = fields.next()?.parse().ok()?;
+            let wt = fields.next()?;
+            let elapsed: u64 = fields.next()?.parse().ok()?;
+            let distro = fields.next()?.to_string();
+            let user = fields.next()?.to_string();
+            let cwd = fields.next()?.to_string();
+            let sock = fields.next()?;
+            let program = PathBuf::from(fields.next()?);
+            fields.next()?; // argv[0]
+            let argv: Vec<String> = fields
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
             let mut session = session_from_argv(
                 SshBackend::Wsl,
                 pid,
-                PathBuf::from("ssh"),
+                program,
                 &argv,
                 now.saturating_sub(elapsed),
             )?;
-            session.wt_session = wt_session;
+            session.wt_session = (!wt.is_empty()).then(|| wt.to_string());
+            session.wsl_context = Some((distro, user));
+            session.cwd = Some(cwd);
+            session.auth_sock = (!sock.is_empty()).then(|| sock.to_string());
             Some(session)
         })
         .collect()
@@ -447,6 +489,9 @@ fn session_from_argv(
         args,
         started,
         wt_session: None,
+        wsl_context: None,
+        cwd: None,
+        auth_sock: None,
     })
 }
 
@@ -528,205 +573,193 @@ fn parse_ssh_args(argv: &[String]) -> Option<(Vec<String>, String)> {
     Some((kept, destination))
 }
 
-struct UploadRecord {
+struct LiveConnection {
     session: SshSession,
-    local: PathBuf,
-    remote: String,
-    /// 是否为本工具生成的临时截图（退出时只清理这类文件，用户自己复制的文件不动）
-    temp_image: bool,
+    transport: crate::remote_transport::Connection,
 }
 
 pub struct RemoteUploader {
-    /// 本会话已成功上传的记录：重复粘贴时跳过上传，退出时据此清理远程临时图
-    uploaded: Mutex<Vec<UploadRecord>>,
+    connections: Mutex<Vec<LiveConnection>>,
 }
 
 impl RemoteUploader {
     pub fn new() -> Self {
         Self {
-            uploaded: Mutex::new(Vec::new()),
+            connections: Mutex::new(Vec::new()),
         }
     }
 
-    /// 上传 `local` 到远程的 `/tmp/wsl_clipboard-<uid>/<文件名>`，返回远程绝对路径。
-    /// 同一目标、同一本地文件只上传一次：剪贴板未变化的重复粘贴直接复用远程路径。
     pub async fn upload(
         &self,
         session: &SshSession,
         local: &Path,
         temp_image: bool,
     ) -> Result<String> {
-        let file_name = local
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|n| !n.is_empty())
-            .ok_or_else(|| anyhow!("无效的文件名: {}", local.display()))?;
-
-        if let Some(remote) = self.find_uploaded(session, local) {
-            info!("远程已存在，跳过上传: {}", remote);
-            return Ok(remote);
+        let mut pool = self.connections.lock().await;
+        let existing = pool.iter().position(|c| c.session.same_target(session));
+        let index = if let Some(i) = existing {
+            if pool[i].transport.healthy().await {
+                Some(i)
+            } else {
+                pool.remove(i);
+                None
+            }
+        } else {
+            None
+        };
+        let i = match index {
+            Some(i) => i,
+            None => {
+                let transport = connect(session).await?;
+                pool.push(LiveConnection {
+                    session: session.clone(),
+                    transport,
+                });
+                pool.len() - 1
+            }
+        };
+        let result = pool[i].transport.upload(local, temp_image).await;
+        // A failed/partial transfer must never leave a desynchronized stream in the pool.
+        if result.is_err() {
+            pool.remove(i);
         }
+        result
+    }
 
-        let file = std::fs::File::open(local)
-            .with_context(|| format!("打开本地文件失败: {}", local.display()))?;
-
-        info!("上传到 {}: {}", session.label(), local.display());
-        let stdout = run_ssh(
-            session,
-            &upload_command(file_name),
-            Stdio::from(file),
-            UPLOAD_TIMEOUT,
-        )
-        .await?;
-
-        // 远程回显的才是展开后的绝对路径；粘贴给 CLI 的必须是绝对路径
-        let remote_path = stdout
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("远程没有回显文件路径"))?;
-
-        if let Ok(mut list) = self.uploaded.lock() {
-            list.push(UploadRecord {
-                session: session.clone(),
-                local: local.to_path_buf(),
-                remote: remote_path.clone(),
-                temp_image,
+    /// Only close existing channels. Never establish a connection or ask for passwords at exit.
+    pub async fn cleanup_on_exit(&self) {
+        let connections = std::mem::take(&mut *self.connections.lock().await);
+        let mut tasks = tokio::task::JoinSet::new();
+        for mut c in connections {
+            tasks.spawn(async move {
+                c.transport.close().await;
             });
         }
-        Ok(remote_path)
+        while tasks.join_next().await.is_some() {}
     }
+}
 
-    fn find_uploaded(&self, session: &SshSession, local: &Path) -> Option<String> {
-        let list = self.uploaded.lock().ok()?;
-        list.iter()
-            .find(|r| r.session.same_target(session) && r.local == local)
-            .map(|r| r.remote.clone())
-    }
-
-    /// 退出时删除本会话上传的临时截图，与本地 `temp/` 的退出清理策略一致
-    pub async fn cleanup_on_exit(&self) {
-        let grouped: Vec<(SshSession, Vec<String>)> = {
-            let Ok(mut list) = self.uploaded.lock() else {
-                return;
-            };
-            let mut grouped: Vec<(SshSession, Vec<String>)> = Vec::new();
-            for record in list.drain(..).filter(|r| r.temp_image) {
-                match grouped
-                    .iter_mut()
-                    .find(|(s, _)| s.same_target(&record.session))
-                {
-                    Some((_, paths)) => paths.push(record.remote),
-                    None => grouped.push((record.session, vec![record.remote])),
-                }
-            }
-            grouped
-        };
-
-        for (session, paths) in grouped {
-            let quoted: Vec<String> = paths.iter().map(|p| sh_quote(p)).collect();
-            let cmd = format!("rm -f {}", quoted.join(" "));
-            info!(
-                "退出清理远程临时图片 ({}): {} 个文件",
-                session.label(),
-                paths.len()
-            );
-            if let Err(e) = run_ssh(&session, &cmd, Stdio::null(), CLEANUP_TIMEOUT).await {
-                warn!("清理远程临时图片失败 ({}): {}", session.label(), e);
-            }
+async fn connect(session: &SshSession) -> Result<crate::remote_transport::Connection> {
+    match connect_attempt(session, true).await {
+        Ok(c) => Ok(c),
+        Err(e) if authentication_needed(&format!("{e:#}")) => {
+            info!("SSH 需要认证，启用密码/密钥口令窗口: {}", session.label());
+            connect_attempt(session, false).await
         }
+        Err(e) => Err(e),
     }
 }
 
-/// 执行一次 ssh 远程命令，返回 stdout；失败时把 stderr 最后一行有效信息带进错误
-async fn run_ssh(
+fn authentication_needed(error: &str) -> bool {
+    // Network failures and changed host keys must not trigger misleading password dialogs.
+    !error.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
+        && (error.contains("Permission denied")
+            || error.contains("Host key verification failed")
+            || error.contains("Too many authentication failures"))
+}
+
+async fn connect_attempt(
     session: &SshSession,
-    remote_cmd: &str,
-    stdin: Stdio,
-    timeout: Duration,
-) -> Result<String> {
-    let (program, args) = ssh_invocation(session, remote_cmd);
-
-    let mut cmd = Command::new(&program);
-    cmd.args(&args)
-        .stdin(stdin)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW)
-        // 超时后 drop 子进程句柄即杀掉 ssh，避免残留
-        .kill_on_drop(true);
-
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("启动 {} 失败", program.display()))?;
-
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .map_err(|_| anyhow!("ssh 超过 {} 秒未完成，已中止", timeout.as_secs()))?
-        .context("等待 ssh 结束失败")?;
-
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let reason = stderr
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("无错误输出");
-    let code = output
-        .status
-        .code()
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "?".to_string());
-    bail!("ssh 退出码 {}: {}", code, reason)
-}
-
-/// 组装 ssh 调用：返回 (程序, 参数)。远程命令作为最后一个参数原样交给 ssh
-fn ssh_invocation(session: &SshSession, remote_cmd: &str) -> (PathBuf, Vec<String>) {
-    let mut args: Vec<String> = Vec::new();
-    let program = match session.backend {
-        SshBackend::Windows => session.program.clone(),
+    silent: bool,
+) -> Result<crate::remote_transport::Connection> {
+    let token = format!("WCH{:032x}", windows::core::GUID::new()?.to_u128());
+    let worker = format!(
+        "sh -c {} sh {}",
+        sh_quote(crate::remote_transport::WORKER),
+        sh_quote(&token)
+    );
+    let mut auth = crate::ssh_auth::Askpass::new(session.label(), silent)?;
+    let options = ssh_options(session, &worker, silent);
+    let mut cmd = match session.backend {
+        SshBackend::Windows => {
+            let mut cmd = Command::new(&session.program);
+            cmd.args(options);
+            auth.windows_env(&mut cmd);
+            if let Some(sock) = &session.auth_sock {
+                cmd.env("SSH_AUTH_SOCK", sock);
+            } else {
+                cmd.env_remove("SSH_AUTH_SOCK");
+            }
+            if let Some(cwd) = &session.cwd {
+                cmd.current_dir(cwd);
+            }
+            cmd
+        }
         SshBackend::Wsl => {
-            // `-e` 直接 exec，不经过 WSL 登录 shell，参数（含引号和 &&）原样到达 ssh
-            args.push("-e".into());
-            args.push("ssh".into());
-            PathBuf::from("wsl.exe")
+            let prefix = session.wsl_prefix();
+            // Existing agent/multiplexed sessions also work with Windows interop disabled.
+            let shim = if silent {
+                "/bin/false".to_string()
+            } else {
+                auth.wsl_script(&prefix).await?
+            };
+            let mut cmd = Command::new("wsl.exe");
+            cmd.args(prefix)
+                .args([
+                    "-e",
+                    "sh",
+                    "-c",
+                    "cd -- \"$1\" && shift && exec env \"$@\"",
+                    "sh",
+                ])
+                .arg(session.cwd.as_deref().unwrap_or("."))
+                .arg(format!(
+                    "SSH_AUTH_SOCK={}",
+                    session.auth_sock.as_deref().unwrap_or("")
+                ))
+                .arg(format!("SSH_ASKPASS={shim}"))
+                .args(["SSH_ASKPASS_REQUIRE=force", "DISPLAY=wsl-clipboard:0"])
+                .arg(&session.program)
+                .args(options);
+            cmd
         }
     };
-    // ssh 对同一选项取最先出现的值，因此这几项放在用户参数之前
-    args.extend([
-        // 没有控制台可交互：不能弹密码 / 指纹确认，直接失败并报错
-        "-o".to_string(),
-        "BatchMode=yes".to_string(),
-        "-o".to_string(),
-        format!("ConnectTimeout={}", CONNECT_TIMEOUT_SECS),
-        // 只保留错误输出，便于把原因显示在托盘气泡里
-        "-o".to_string(),
-        "LogLevel=ERROR".to_string(),
-    ]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    crate::remote_transport::Connection::start(
+        cmd,
+        token,
+        if silent {
+            SILENT_AUTH_TIMEOUT
+        } else {
+            AUTH_TIMEOUT
+        },
+    )
+    .await
+}
+
+fn ssh_options(session: &SshSession, remote_cmd: &str, silent: bool) -> Vec<String> {
+    // First value wins. Preserve routing/authentication and existing ControlPath, while
+    // preventing tty allocation, extra forwards, and user LocalCommand side effects.
+    let mut args = vec!["-T".to_string()];
+    for option in [
+        format!("BatchMode={}", if silent { "yes" } else { "no" }),
+        format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"),
+        "LogLevel=ERROR".into(),
+        "NumberOfPasswordPrompts=1".into(),
+        "ServerAliveInterval=15".into(),
+        "ServerAliveCountMax=2".into(),
+        "RequestTTY=no".into(),
+        "RemoteCommand=none".into(),
+        "ClearAllForwardings=yes".into(),
+        "PermitLocalCommand=no".into(),
+        "ForwardAgent=no".into(),
+        "ForwardX11=no".into(),
+        "ControlMaster=no".into(),
+    ] {
+        args.push("-o".into());
+        args.push(option);
+    }
     args.extend(session.args.iter().cloned());
     args.push(remote_cmd.to_string());
-    (program, args)
+    args
 }
 
-/// 远程端执行的命令：建目录 → 把 stdin 写成文件 → 回显展开后的绝对路径
-fn upload_command(file_name: &str) -> String {
-    let file = format!("{}/{}", REMOTE_DIR_EXPR, sh_quote(file_name));
-    format!(
-        "mkdir -p {} && cat > {} && printf '%s\\n' {}",
-        REMOTE_DIR_EXPR, file, file
-    )
-}
-
-/// POSIX shell 单引号转义
 fn sh_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+    crate::ssh_auth::quote(s)
 }
+
+#[cfg(test)]
+include!("../tests/support/remote_fixture.rs");
 
 #[cfg(test)]
 mod tests {
@@ -739,16 +772,6 @@ mod tests {
     #[test]
     fn sh_quote_escapes_single_quotes() {
         assert_eq!(sh_quote("a'b c"), "'a'\\''b c'");
-    }
-
-    #[test]
-    fn upload_command_creates_dir_writes_stdin_and_echoes_path() {
-        assert_eq!(
-            upload_command("clip_1.png"),
-            "mkdir -p /tmp/wsl_clipboard-\"$(id -u)\" \
-             && cat > /tmp/wsl_clipboard-\"$(id -u)\"/'clip_1.png' \
-             && printf '%s\\n' /tmp/wsl_clipboard-\"$(id -u)\"/'clip_1.png'"
-        );
     }
 
     #[test]
@@ -817,8 +840,11 @@ mod tests {
 
     #[test]
     fn ps_output_is_parsed_and_non_sessions_skipped() {
-        let text = "123 b51a3c4d-7526 40 ssh -p 22 dev\n124 - 5 /usr/bin/ssh -N -L 1:2:3 tun\n\
-                    125 - 7 ssh box\n garbage\n";
+        let text = concat!(
+            "\x1e123\0b51a3c4d-7526\x0040\0Ubuntu\0dev\0/home/dev\0/tmp/agent/sock\0/usr/bin/ssh\0ssh\0-p\x0022\0dev\0",
+            "\x1e124\0\x005\0Ubuntu\0dev\0/home/dev\0\0/usr/bin/ssh\0ssh\0-N\0tun\0",
+            "\x1e125\0\x007\0Ubuntu\0dev\0/home/dev\0\0/usr/bin/ssh\0ssh\0box\0"
+        );
         let sessions = parse_ps_output(text, 1_000);
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].pid, 123);
@@ -834,7 +860,10 @@ mod tests {
     fn pick_prefers_foreground_tab_then_foreground_app() {
         let sessions = || {
             ["a", "b", "c"]
-                .map(|d| session_from_argv(SshBackend::Windows, 1, "ssh.exe".into(), &argv(d), 0).unwrap())
+                .map(|d| {
+                    session_from_argv(SshBackend::Windows, 1, "ssh.exe".into(), &argv(d), 0)
+                        .unwrap()
+                })
                 .to_vec()
         };
         let chosen = |focus: &[Focus]| pick(sessions(), focus).map(|(s, _)| s.destination);
@@ -848,32 +877,35 @@ mod tests {
     }
 
     #[test]
-    fn wsl_backend_execs_ssh_through_wsl_exe() {
+    fn ssh_options_allow_authentication_without_overriding_routes() {
         let session = session_from_argv(
-            SshBackend::Wsl,
+            SshBackend::Windows,
             1,
-            PathBuf::from("ssh"),
-            &argv("-p 22 dev-box"),
+            "ssh.exe".into(),
+            &argv("-p 2222 -i key -J jump dev"),
             0,
         )
         .unwrap();
-        let (program, args) = ssh_invocation(&session, "true");
-        assert_eq!(program, PathBuf::from("wsl.exe"));
-        assert_eq!(args[..2], ["-e", "ssh"]);
-        assert_eq!(args[2..4], ["-o", "BatchMode=yes"]);
-        assert_eq!(args[args.len() - 4..], ["-p", "22", "dev-box", "true"]);
+        let args = ssh_options(&session, "worker", false);
+        assert_eq!(args[0], "-T");
+        assert!(args.contains(&"BatchMode=no".to_string()));
+        assert!(args.contains(&"ControlMaster=no".to_string()));
+        assert_eq!(
+            &args[args.len() - 8..],
+            ["-p", "2222", "-i", "key", "-J", "jump", "dev", "worker"]
+        );
+        assert!(ssh_options(&session, "worker", true).contains(&"BatchMode=yes".to_string()));
     }
 
     #[test]
-    fn windows_backend_reuses_discovered_ssh_exe() {
-        let exe = PathBuf::from("C:\\Windows\\System32\\OpenSSH\\ssh.exe");
-        let session =
-            session_from_argv(SshBackend::Windows, 1, exe.clone(), &argv("root@h"), 0).unwrap();
-        let (program, args) = ssh_invocation(&session, "true");
-        assert_eq!(program, exe);
-        assert_eq!(args[0], "-o");
-        assert_eq!(args[args.len() - 2..], ["root@h", "true"]);
-        assert_eq!(session.label(), "root@h  (Windows ssh)");
+    fn only_authentication_errors_enable_dialogs() {
+        assert!(authentication_needed(
+            "Permission denied (publickey,password)."
+        ));
+        assert!(!authentication_needed("Connection refused"));
+        assert!(!authentication_needed(
+            "REMOTE HOST IDENTIFICATION HAS CHANGED! Host key verification failed."
+        ));
     }
 
     #[test]
@@ -883,5 +915,34 @@ mod tests {
         let c = session_from_argv(SshBackend::Wsl, 1, "ssh".into(), &argv("h"), 0).unwrap();
         assert!(a.same_target(&b));
         assert!(!a.same_target(&c));
+    }
+
+    #[test]
+    fn connection_identity_separates_clients_and_authentication_environments() {
+        let a = session_from_argv(SshBackend::Windows, 1, "ssh.exe".into(), &argv("h"), 0).unwrap();
+        let mut b = a.clone();
+        b.program = "other-ssh.exe".into();
+        assert!(!a.same_target(&b));
+        b = a.clone();
+        b.cwd = Some("C:\\other".into());
+        assert!(!a.same_target(&b));
+        b = a.clone();
+        b.auth_sock = Some("/tmp/other-agent".into());
+        assert!(!a.same_target(&b));
+        b = a.clone();
+        b.wsl_context = Some(("Other".into(), "dev".into()));
+        assert!(!a.same_target(&b));
+    }
+
+    #[test]
+    fn wsl_preserves_agent_and_paths_with_spaces() {
+        let text = "\x1e12\0tab\x001\0Ubuntu\0dev\0/home/dev/my work\0/tmp/agent socket\0/usr/bin/ssh\0ssh\0-i\0keys/my key\0box\0";
+        let sessions = parse_ps_output(text, 10);
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.args, ["-i", "keys/my key", "box"]);
+        assert_eq!(session.cwd.as_deref(), Some("/home/dev/my work"));
+        assert_eq!(session.auth_sock.as_deref(), Some("/tmp/agent socket"));
+        assert_eq!(session.wsl_prefix(), ["-d", "Ubuntu", "-u", "dev"]);
     }
 }

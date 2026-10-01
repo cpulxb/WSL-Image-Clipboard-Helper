@@ -198,7 +198,12 @@ unsafe fn active_wt_console(wt: HWND) -> Option<HWND> {
             let mut marked = original.clone();
             marked.extend(std::iter::repeat(ZWSP).take(i + 1));
             if set_console_title(&marked) {
-                marks.push(Mark { console, pid, original, marked });
+                marks.push(Mark {
+                    console,
+                    pid,
+                    original,
+                    marked,
+                });
             }
         }
         if marks.is_empty() {
@@ -316,7 +321,10 @@ unsafe fn top_level_windows() -> Vec<HWND> {
         BOOL::from(true)
     }
     let mut windows: Vec<HWND> = Vec::new();
-    let _ = EnumWindows(Some(collect), LPARAM(&mut windows as *mut Vec<HWND> as isize));
+    let _ = EnumWindows(
+        Some(collect),
+        LPARAM(&mut windows as *mut Vec<HWND> as isize),
+    );
     windows
 }
 
@@ -326,15 +334,14 @@ pub fn env_var(pid: u32, name: &str) -> Option<String> {
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
     };
     unsafe {
-        let handle =
-            OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid).ok()?;
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid).ok()?;
         let value = read_env_var(handle, name);
         let _ = CloseHandle(handle);
         value
     }
 }
 
-unsafe fn read_env_var(handle: HANDLE, name: &str) -> Option<String> {
+unsafe fn process_parameters(handle: HANDLE) -> Option<usize> {
     use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 
     /// PROCESS_BASIC_INFORMATION（x64 布局）
@@ -350,10 +357,6 @@ unsafe fn read_env_var(handle: HANDLE, name: &str) -> Option<String> {
     }
     /// x64：PEB.ProcessParameters
     const PEB_PROCESS_PARAMETERS: usize = 0x20;
-    /// x64：RTL_USER_PROCESS_PARAMETERS.Environment / EnvironmentSize
-    const PARAMS_ENVIRONMENT: usize = 0x80;
-    const PARAMS_ENVIRONMENT_SIZE: usize = 0x3F0;
-    const MAX_ENV_BYTES: usize = 256 * 1024;
 
     let mut info = BasicInfo::default();
     let mut len = 0u32;
@@ -367,7 +370,14 @@ unsafe fn read_env_var(handle: HANDLE, name: &str) -> Option<String> {
     if !status.is_ok() || info.peb == 0 {
         return None;
     }
-    let params: usize = read_remote(handle, info.peb + PEB_PROCESS_PARAMETERS)?;
+    read_remote(handle, info.peb + PEB_PROCESS_PARAMETERS)
+}
+
+unsafe fn read_env_var(handle: HANDLE, name: &str) -> Option<String> {
+    const PARAMS_ENVIRONMENT: usize = 0x80;
+    const PARAMS_ENVIRONMENT_SIZE: usize = 0x3F0;
+    const MAX_ENV_BYTES: usize = 256 * 1024;
+    let params = process_parameters(handle)?;
     let env: usize = read_remote(handle, params + PARAMS_ENVIRONMENT)?;
     let size: usize = read_remote(handle, params + PARAMS_ENVIRONMENT_SIZE)?;
     if env == 0 {
@@ -381,6 +391,38 @@ unsafe fn read_env_var(handle: HANDLE, name: &str) -> Option<String> {
         .split(|&c| c == 0)
         .find(|entry| entry.starts_with(&prefix))
         .map(|entry| String::from_utf16_lossy(&entry[prefix.len()..]))
+}
+
+/// Preserve the launching directory for relative -i/-F and ProxyCommand paths.
+pub fn process_directory(pid: u32) -> Option<String> {
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    };
+    #[repr(C)]
+    #[derive(Default)]
+    struct UnicodeString {
+        length: u16,
+        maximum: u16,
+        buffer: usize,
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid).ok()?;
+        let value = (|| {
+            let params = process_parameters(handle)?;
+            let directory: UnicodeString = read_remote(handle, params + 0x38)?;
+            if directory.length == 0
+                || directory.length > directory.maximum
+                || directory.buffer == 0
+            {
+                return None;
+            }
+            let mut text = vec![0u16; directory.length as usize / 2];
+            read_remote_into(handle, directory.buffer, &mut text)?;
+            Some(String::from_utf16_lossy(&text))
+        })();
+        let _ = CloseHandle(handle);
+        value
+    }
 }
 
 unsafe fn read_remote<T: Default>(handle: HANDLE, addr: usize) -> Option<T> {
@@ -404,6 +446,15 @@ unsafe fn read_remote_into<T>(handle: HANDLE, addr: usize, buf: &mut [T]) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_current_process_working_directory() {
+        let current = std::env::current_dir().unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(process_directory(std::process::id()).unwrap()),
+            current
+        );
+    }
 
     fn proc(pid: u32, ppid: u32) -> ProcEntry {
         ProcEntry {

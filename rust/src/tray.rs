@@ -544,7 +544,7 @@ unsafe fn handle_menu_command(cmd_id: u32) {
             let idx = (cmd_id - CMD_REMOTE_BASE) as usize;
             if let Some(session) = state.discovered.get(idx) {
                 let session = session.clone();
-                switch_remote_mode(state, RemoteMode::Pinned(session));
+                switch_remote_mode(state, RemoteMode::Pinned(Box::new(session)));
             }
         }
         CMD_OPEN_FOLDER => {

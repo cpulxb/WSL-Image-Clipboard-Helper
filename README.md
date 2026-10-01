@@ -34,7 +34,7 @@
 #### ✅ 解决方案
 本工具用于弥补这个缺口：通过全局快捷键（默认 `Alt+V`），自动读取 Windows 剪贴板图片，保存到本地 `temp/` 目录，并把对应 WSL 路径（`/mnt/c/...`）粘贴到当前输入窗口，让 AI 工具可以直接消费图片文件。
 
-当前主版本是 Rust 实现（`v4.0`）。推荐直接下载 GitHub Release `v4.0` 或 latest release 中的预编译版本。
+当前主版本使用 Rust 实现。GitHub Release 提供预编译版本；下面注明“未发布”的改进对应当前源码和本地构建。
 
 ### ✨ 核心特性
 
@@ -47,7 +47,7 @@
 - 🪟 Windows 集成：内嵌多尺寸图标，并带 DPI-aware manifest，高 DPI 环境显示更稳定
 - 📁 Explorer 路径转换：在资源管理器复制文件后按 `Alt+V`，会粘贴对应 `/mnt/...` 路径
 - 🎯 路径格式可切换：纯路径 / `@` 前缀（适配 Kimi Code CLI、Gemini CLI、Qwen Code）/ 引号包裹
-- 🌐 远程粘贴（SSH）：在终端里 ssh 到远程机器跑 Codex / Claude Code 时，自动识别当前 ssh 会话，图片先上传到远程再粘贴远程路径，无需任何配置
+- 🌐 远程粘贴（SSH）：在终端里 ssh 到远程机器跑 Codex / Claude Code 时，自动识别当前 ssh 会话，图片先上传到远程再粘贴远程路径；自动复用上传连接，需要认证时弹窗输入
 
 ![clip_20260217_184919_809](./img/clip_20260217_184919_809.png)
 
@@ -136,21 +136,81 @@ WSL-Image-Clipboard-Helper/
 - 不希望本工具碰输入法，可在托盘 `输入法保护` 中选择 `关闭（不干预输入法）`
 - 若托盘图标未显示，请检查任务栏隐藏图标区域
 - 默认粘贴纯路径；Kimi 等需要 `@` 文件引用的 CLI，请在托盘菜单切换 `路径格式`
-- 在终端里 ssh 到远程机器跑 CLI 时，热键会自动把图片传到远程再粘贴远程路径；前提是该主机能用公钥免密登录，见下文
+- 在终端里 ssh 到远程机器跑 CLI 时，热键会自动把图片传到远程再粘贴远程路径；支持密码和密钥登录，首次上传可能需要额外认证，见下文
 
 ### 🌐 远程粘贴（SSH）
 
 适用场景：你在 Windows Terminal / WSL 里 `ssh` 到一台远程服务器，在上面运行 Codex、Claude Code 等 CLI（[issue #11](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/11)）。此时本地 `/mnt/c/...` 路径在远程不可见，热键会先把图片传过去、再粘贴远程路径。
 
-**用法和本地完全一样：在远程终端的 CLI 输入框按热键即可，不需要任何配置。** 程序会在按下热键时自动枚举当前打开的 ssh 会话（Windows 侧的 `ssh.exe` 和 WSL 里的 `ssh` 都算），找出**你正在粘贴的那个终端 tab** 里的会话，复用那条会话的 ssh 参数（用户、主机、端口、`-i` 密钥、`-J` 跳板、`~/.ssh/config` 别名等）新建一条连接上传图片，然后粘贴远程绝对路径（如 `/tmp/wsl_clipboard-1000/clip_20260917_120000_123.png`），CLI 照常识别成 `[Image #n]`。`路径格式`（`@` 前缀 / 引号）同样生效。
+**以下自动认证与连接复用是当前源码新增功能，尚未发布到 GitHub Release。旧版本仍要求后台 SSH 能免交互认证。**
 
-唯一前提：**该主机要能用公钥免密登录**。程序没有控制台，新建的 ssh 连接无法输入密码。如果你平时是敲密码登录的，每台主机做一次（Windows 侧 PowerShell 示例，会要一次密码）：
+日常用法：照常 SSH 登录，在远程 CLI 输入框按 `Alt+V`。程序自动识别当前终端 tab，沿用登录所用的客户端、用户、主机、端口、`-i` 密钥、`-J` 跳板及 SSH config 别名。
 
-```powershell
-type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh user@host "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
+| 发起 SSH 的环境 | 密码登录 | 密钥登录 |
+| --- | --- | --- |
+| Windows PowerShell / CMD | 第一次上传若不能自动认证，会弹出密码输入框；输入的是**服务器密码** | 优先使用原密钥与 Windows agent；私钥有口令且未解锁时，弹窗输入**密钥口令** |
+| WSL（当前仅扫描默认发行版的默认用户） | 优先尝试已有的 SSH 复用连接；没有时，第一次上传弹窗输入服务器密码 | 使用原会话的密钥、工作目录和 `SSH_AUTH_SOCK`；agent 已解锁则自动认证，否则弹窗口令框 |
+
+两种环境分别处理，Windows 与 WSL 的密钥、agent、配置和上传连接不会混用。
+
+#### Windows PowerShell：密码登录
+
+1. 按原习惯登录，例如 `ssh user@host`，输入服务器密码。
+2. 在远程运行 CLI，复制图片后按 `Alt+V`。
+3. 如果出现本工具的认证窗口，按窗口中的 SSH 提示输入服务器密码；成功后上传图片并粘贴远程路径。
+4. 后续图片复用工具维护的连接，不再逐张认证。不需要先生成密钥或修改服务器的 `authorized_keys`。
+
+工具维护的是额外的上传连接，不能直接接管已经运行的 Windows `ssh.exe`，所以首次上传可能比终端登录**多输入一次密码**。
+
+#### WSL：密码登录
+
+仍然照常 `ssh user@host`、启动 CLI、按 `Alt+V`。没有配置 SSH 连接复用也能使用：程序在需要时弹出 Windows 认证窗口（需要 WSL 启用 Windows interop）。
+
+如果你已设置 `ControlMaster` / `ControlPath`，程序会先尝试复用它，成功时不用再输密码。**不要求你为了粘图手动设置复用。** 如果想连日常 SSH 新标签页也省去重复认证，可以在 WSL 一次设置：
+
+```bash
+mkdir -p ~/.ssh/cm
+chmod 700 ~/.ssh ~/.ssh/cm
 ```
 
-没有密钥就先 `ssh-keygen -t ed25519`；从 WSL 侧 ssh 的话用 `ssh-copy-id user@host`。之后你平时登录也不用再输密码。
+将下面设置合并进 WSL 的 `~/.ssh/config`，已有相同配置时不要重复添加；已有更具体的 Host 设置优先：
+
+```sshconfig
+Host *
+    ControlMaster auto
+    ControlPath ~/.ssh/cm/%C
+    ControlPersist 10m
+```
+
+随后重新正常登录一次。适用于同一 WSL 发行版和用户、连接参数匹配的会话；这一配置不是 Windows 自带 OpenSSH 的配置方案。
+
+#### 已使用密钥登录：Windows 与 WSL
+
+保持原来的登录命令即可，包括自定义密钥：
+
+```powershell
+# Windows PowerShell
+ssh -i "$env:USERPROFILE\.ssh\server_key" user@host
+```
+
+```bash
+# WSL
+ssh -i ~/.ssh/server_key user@host
+```
+
+无口令私钥或已解锁的 agent 通常不弹窗。带口令私钥也不强制要求你配置 agent：需要时可直接在本工具窗口输入密钥口令。WSL 会从原 SSH 进程读取 `SSH_AUTH_SOCK`，不再依赖工具启动时是否继承了终端的 agent 环境。
+
+如果你本来就使用 agent，可继续使用：Windows 为 OpenSSH 的 `ssh-agent` 服务配合 `ssh-add`；WSL 为当前发行版里的 agent 配合 `ssh-add`。无需为了使用本工具在 Windows 和 WSL 之间复制私钥。
+
+#### 每个新 SSH 都要重新操作吗？
+
+- **每张图片**：不用重新配置或认证；已有上传连接会持续复用。
+- **同一目标新开 tab**：客户端、SSH 参数、工作目录及认证环境一致时，会共用已有上传连接。
+- **不同服务器、账号或 Windows/WSL 环境**：分别建立上传连接；需要时各认证一次。
+- **连接失效或工具重启**：重新尝试自动认证，需要时再弹窗。密码和密钥口令不保存到磁盘。
+- **取消或输错**：本次不粘贴，回到原终端再次按热键重试。不要在命令行或配置文件里保存密码。
+- **主机指纹**：沿用原 SSH 的主机校验；如果 SSH 要求确认新指纹，会显示确认窗口。主机密钥变更报错不会自动忽略。
+- **认证或上传时切换了窗口**：为防止粘到其他应用，会暂停粘贴；返回原终端再按热键。
 
 托盘菜单 `远程粘贴（SSH）`：
 
@@ -164,10 +224,10 @@ type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh user@host "mkdir -p ~/.ssh && ca
 
 - 只有**交互式登录**的 ssh 会被识别；`ssh -N` 端口转发、VS Code Remote-SSH（`-T`）、git 等带远程命令且没有 `-t` 的进程会被忽略，不会误触发。
 - 同一个 Windows Terminal 窗口里本地 tab 和 ssh tab 并存时，按热键前所在的 tab 决定粘本地路径还是上传。判断方法是给各 tab 的标题临时追加一个不可见的零宽字符、看窗口标题变成哪个，随即还原，不影响显示。判断不出具体 tab 时（profile 开了 `suppressApplicationTitle`、VS Code 等其他终端、WSL 里的 ssh 跑在 tmux / screen 中），退回为“前台程序里最近打开的 ssh 会话”；这种情况下若粘错，可在托盘里固定会话或关闭远程粘贴。
-- WSL 侧只枚举默认发行版里的 ssh；Windows 侧枚举所有 `ssh.exe`（含 Git 附带的），上传时复用发现到的那个可执行文件及其配置。
-- 上传目录固定为远程的 `/tmp/wsl_clipboard-<uid>/`，不存在会自动创建；传输只用一条 ssh 连接（远程执行 `mkdir -p DIR && cat > DIR/FILE`，文件走 stdin），不依赖远程装有 `scp` / `sftp-server`。每次粘贴多出一次 ssh 建连的耗时（通常零点几秒到一两秒）。
+- WSL 侧只枚举默认发行版、默认用户的 ssh，并保留发行版/用户/工作目录/agent 环境；Windows 侧枚举所有 `ssh.exe`（含 Git 附带的），上传时复用发现到的那个可执行文件及其配置。
+- 每条上传连接使用独立的 `/tmp/wsl_clipboard-<uid>-<随机值>/` 私有目录，文件名带内部唯一前缀。通过一条持续的 SSH 连接传输，后续图片省去建连和认证。远端需要 POSIX `sh` 及常见 Linux 工具 `mktemp`、`head -c`、`wc`、`mv`、`rm`，不需要安装服务或 `scp` / `sftp-server`。
 - 上传失败（认证失败、主机不可达、超时等）会弹托盘气泡提示原因，并且**不粘贴任何内容**。
-- 同一张截图重复粘贴不会重复上传；程序退出时会删除本次会话上传到远程的临时截图，与本地 `temp/` 清理策略一致。
+- 同一有效连接上重复粘贴截图不会重复上传。退出时只关闭已有上传连接，不重新认证；远程 shell 在连接结束时清理截图。异常断网时清理可能延迟到服务端发现断线；复制上传的普通文件会保留。
 - 在 Explorer 复制文件后按热键，文件同样会上传并粘贴远程路径（不支持目录）。
 
 ### ⌨️ 输入法保护策略
@@ -228,7 +288,7 @@ v4.1.3 起：
 
 **Q6：我是 ssh 到远程服务器上跑 Codex 的，能直接粘贴图片吗？**（[issue #11](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/11)）
 
-可以，v4.2 起支持，且不需要配置：按热键时程序会自动找到你当前打开的 ssh 会话（无论是从 Windows 侧还是 WSL 侧 ssh 的），用同样的参数把图片上传到远程，再粘贴远程路径。唯一前提是这台主机能用公钥免密登录（程序没有控制台，无法替你输密码）；平时敲密码登录的话，先把本机公钥加进远程 `~/.ssh/authorized_keys`（每台主机一次）。详见上文「远程粘贴（SSH）」。
+可以。v4.2 引入远程图片上传；当前源码进一步支持密码/密钥口令弹窗和持续连接复用。Windows 和 WSL 都可以照常登录后按热键，首次上传可能需要额外认证，后续复用连接。详见上文「远程粘贴（SSH）」；旧 Release 的认证限制与当前源码不同。
 
 ### 🛠️ Rust 版本编译（推荐）
 
@@ -284,7 +344,15 @@ rustup target add x86_64-pc-windows-msvc
 
 ### 🕒 版本历史
 
-#### v4.2（当前版本，Rust） ✅
+#### 未发布：SSH 认证与连接复用
+
+- Windows / WSL 均支持按需密码、密钥口令及 SSH 认证提示窗口，不保存密码
+- 优先使用已有密钥、agent 或 WSL ControlPath；建立上传连接后持续复用，断线后重新认证
+- WSL 保留原会话的 agent socket、发行版、用户、工作目录和含空格的参数
+- 退出取消等待中的认证并关闭现有连接；窗口改变时暂停粘贴，避免误贴
+- 自动化验证方法见 [SSH 认证测试](docs/ssh-auth-testing.md)
+
+#### v4.2（Rust） ✅
 
 - 新增 `远程粘贴（SSH）`：在终端里 ssh 到远程机器运行 CLI 时，图片先通过 ssh 上传到远程，再粘贴远程路径（#11）
 - 零配置：按热键时自动枚举当前打开的 ssh 会话（Windows 侧 `ssh.exe` 与 WSL 侧 `ssh`），复用其用户 / 主机 / 端口 / 密钥 / 跳板 / 别名参数；只识别交互式登录会话，`-N` 隧道、VS Code Remote-SSH、git 等不会误触发
@@ -358,7 +426,7 @@ Many AI CLI agents (Codex, Amazon Q Developer CLI, OpenCode, Claude Code, etc.) 
 #### ✅ Solution
 This project automates that workaround with a global hotkey (default `Alt+V`): it captures clipboard image data, saves a PNG file, and pastes the WSL path (`/mnt/...`) into the active input control.
 
-Current mainline release is Rust-based (`v4.0`). The recommended path is to download the prebuilt GitHub Release `v4.0` or the latest release.
+The project uses Rust. GitHub Releases provide prebuilt binaries; changes marked unreleased describe the current source and local builds.
 
 ### ✨ Highlights
 
@@ -437,21 +505,43 @@ WSL-Image-Clipboard-Helper/
 - To stop the helper from touching your IME at all, pick `关闭（不干预输入法）` under the tray `输入法保护` (IME guard) submenu.
 - If the tray icon is not visible, check the hidden icons area in the Windows taskbar.
 - Plain paths are pasted by default; for CLIs that need `@` file references (e.g. Kimi Code CLI), switch `路径格式` (path style) in the tray menu.
-- If the CLI runs on a remote host over SSH, the hotkey uploads the image there and pastes the remote path automatically; the host must accept key-based login — see below.
+- If the CLI runs on a remote host over SSH, the hotkey uploads the image there and pastes the remote path automatically; password and key authentication are supported in the current source; the first upload may request additional authentication — see below.
 
 ### 🌐 Remote paste over SSH
 
 For the case where you `ssh` from Windows Terminal / WSL into a server and run Codex, Claude Code, etc. **there** ([issue #11](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/11)). A local `/mnt/c/...` path is meaningless on the remote side, so the hotkey uploads the image first and pastes the remote path.
 
-**It works exactly like local paste: press the hotkey in the CLI's input box inside the remote terminal. No configuration needed.** On each hotkey press the helper enumerates the SSH sessions currently open (both Windows-side `ssh.exe` and `ssh` inside WSL), picks the one in **the terminal tab you are pasting into**, reuses that session's SSH arguments (user, host, port, `-i` key, `-J` jump host, `~/.ssh/config` alias, …) to open one more connection for the upload, then pastes the absolute remote path (e.g. `/tmp/wsl_clipboard-1000/clip_20260917_120000_123.png`), which the CLI renders as `[Image #n]` as usual. The `路径格式` (path style) setting still applies.
+**Automatic authentication and persistent uploads are unreleased source changes. Older Release binaries still require non-interactive background SSH authentication.**
 
-The one prerequisite: **the host must accept key-based (passwordless) login.** The helper has no console, so the extra connection cannot type a password. If you normally log in with a password, do this once per host (Windows-side PowerShell example; it asks for the password one last time):
+Log in normally, start your remote CLI, copy an image, and press `Alt+V`. The helper detects the current terminal tab and preserves the SSH client, user, host, port, identity file, jump host and config alias.
 
-```powershell
-type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh user@host "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
+| SSH environment | Password login | Key login |
+| --- | --- | --- |
+| Windows PowerShell / CMD | First upload can request the server password in a native dialog | Existing key/agent first; an encrypted private key can request its passphrase |
+| WSL (currently the default distro and its default user) | Existing ControlPath connection first; otherwise a native Windows password dialog | Preserves the original session's key, working directory and SSH_AUTH_SOCK; asks for a passphrase if needed |
+
+Windows and WSL retain separate configurations, agents and upload connections. A Windows SSH process that is already logged in cannot be taken over by the helper, so the first upload may require **one additional password entry**. Public-key deployment and manual agent setup are optional.
+
+**Windows:** keep using `ssh user@host` or `ssh -i "$env:USERPROFILE\.ssh\server_key" user@host`. Enter the **server password** or **private-key passphrase** according to the dialog's SSH prompt. The helper retains the authenticated upload connection, not a saved password.
+
+**WSL:** keep using `ssh user@host` or `ssh -i ~/.ssh/server_key user@host`. An existing agent is discovered from the original SSH process, even if its socket was set in another terminal. Existing SSH multiplexing is tried first. Manual multiplexing is not required; optionally, create `~/.ssh/cm` with mode 700 and merge the following into WSL's `~/.ssh/config` to simplify normal SSH logins too:
+
+```sshconfig
+Host *
+    ControlMaster auto
+    ControlPath ~/.ssh/cm/%C
+    ControlPersist 10m
 ```
 
-Run `ssh-keygen -t ed25519` first if you have no key; from the WSL side simply use `ssh-copy-id user@host`. Your regular logins stop asking for a password too.
+Reconnect normally after changing it. Existing specific Host settings take precedence. This applies to matching connections under the same WSL user/distro; it is not a configuration recipe for native Windows OpenSSH.
+
+**When authentication is needed:**
+
+- Repeated images and new tabs with the same client, SSH arguments, working directory and authentication environment share one live upload connection.
+- Different servers/accounts/environments authenticate separately. After a disconnect or helper restart, automatic authentication is tried again, followed by a prompt if necessary.
+- Passwords/passphrases are not written to disk. Cancel or an incorrect password stops that paste; press the hotkey again to retry.
+- SSH host verification is preserved. New-host confirmation can be shown when requested by SSH; the helper does not relax host verification or bypass changed-key errors.
+- If the foreground window changes during authentication/upload, paste is paused. Return to the original terminal and press the hotkey again.
 
 Tray submenu `远程粘贴（SSH）` (remote paste):
 
@@ -465,10 +555,10 @@ Notes:
 
 - Only **interactive login** sessions are detected; `ssh -N` port forwards, VS Code Remote-SSH (`-T`), git and other invocations that run a remote command without `-t` are ignored, so they never trigger an upload.
 - With a local tab and an SSH tab side by side in one Windows Terminal window, the tab you press the hotkey in decides between the local path and an upload. The helper tells tabs apart by briefly appending an invisible zero-width character to each tab's title, seeing which one the window title picks up, and restoring it right away. When the tab cannot be determined (profile has `suppressApplicationTitle`, VS Code or other terminals, WSL `ssh` inside tmux/screen), it falls back to the most recently opened SSH session of the foreground app; pin a session or turn remote paste off in the tray if that guesses wrong.
-- On the WSL side only the default distro is scanned; on the Windows side every `ssh.exe` (including the one bundled with Git) is considered, and the upload reuses the very executable and configuration that session uses.
-- Files land in `/tmp/wsl_clipboard-<uid>/` on the remote host (created on demand). A single SSH connection does the transfer (`mkdir -p DIR && cat > DIR/FILE` with the file streamed via stdin), so `scp`/`sftp-server` are not required. Each paste costs one SSH connection setup (typically well under two seconds).
+- On the WSL side only the default distro and default user are scanned; the original distro/user, working directory and agent socket are retained; on the Windows side every `ssh.exe` (including the one bundled with Git) is considered, and the upload reuses the very executable and configuration that session uses.
+- Each upload connection gets a private `/tmp/wsl_clipboard-<uid>-<random>/` directory with uniquely prefixed filenames. A persistent SSH channel carries successive binary transfers, avoiding repeated setup. The remote needs POSIX `sh` and common Linux tools (`mktemp`, `head -c`, `wc`, `mv`, `rm`), but no installed helper, `scp` or SFTP server.
 - If the upload fails (auth failure, host unreachable, timeout…) a tray balloon shows the reason and **nothing is pasted**.
-- Re-pasting the same screenshot does not upload it again; temporary screenshots uploaded during the session are deleted from the remote host on exit, mirroring the local `temp/` cleanup.
+- Re-pasting the same screenshot on a live connection uses its cached path. Exiting only closes existing channels and never reauthenticates. The remote shell cleans screenshots when the channel ends; after a network failure, cleanup may wait until the server detects the disconnect. Ordinary copied files are retained.
 - Files copied in Explorer are uploaded the same way and their remote paths are pasted (directories are not supported).
 
 ### ⌨️ IME guard strategies
@@ -510,7 +600,7 @@ If an earlier version already left English (United States) in your language list
 
 **Q6: I run Codex on a remote server over SSH — can I still paste images?** ([issue #11](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/issues/11))
 
-Yes, since v4.2, with no configuration: on each hotkey press the helper finds the SSH session you currently have open (whether started from the Windows side or from inside WSL), uploads the image with the same SSH arguments and pastes the remote path. The only prerequisite is key-based passwordless login to that host (the helper has no console to type a password); if you log in with a password today, add your public key to the remote `~/.ssh/authorized_keys` once per host. See "Remote paste over SSH" above.
+Yes. v4.2 introduced SSH uploads; the current source adds password/passphrase dialogs and persistent upload connections for both Windows and WSL. Log in normally and press the hotkey. The first upload may need extra authentication, then subsequent images reuse that connection. See “Remote paste over SSH”; older Release binaries have different authentication requirements.
 
 If you prefer building from source:
 

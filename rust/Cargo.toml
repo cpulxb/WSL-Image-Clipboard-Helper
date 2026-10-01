@@ -30,6 +30,7 @@ windows = { version = "=0.52", features = [
     "Win32_System_Diagnostics_Debug",
     # 单实例：CreateMutexW（参数含 SECURITY_ATTRIBUTES）
     "Win32_Security",
+    "Win32_Security_Credentials",
 ] }
 
 # 全局热键
@@ -46,6 +47,7 @@ dirs = "5.0"
 # 错误处理
 anyhow = "1.0"
 thiserror = "1.0"
+zeroize = "1.8"
 
 # 图片处理 (可选)
 image = { version = "0.24", optional = true }
@@ -66,6 +68,11 @@ winresource = "0.1"
 [features]
 default = ["image-support"]
 image-support = ["dep:image"]
+
+[[test]]
+name = "ssh_integration"
+path = "tests/ssh_integration.rs"
+harness = false
 
 [profile.release]
 lto = true

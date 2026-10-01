@@ -78,18 +78,24 @@ Language: [中文说明](#中文说明) | [English Version](#english-version)
     │
     ├─→ 前台 tab 里没有会话（或托盘选了关闭）──→ 粘贴本地 /mnt 路径
     │
-    ├─→ 会话内已上传过同一文件？ ──是──→ 复用远程路径
-    │                │否
-    ├─→ 用发现到的 ssh（Windows: 同一个 ssh.exe / WSL: wsl.exe -e ssh）+ 同一份参数新建连接，本地文件作为 stdin
-    │       远程执行 mkdir -p DIR && cat > DIR/FILE && printf '%s\n' DIR/FILE
-    │       DIR = /tmp/wsl_clipboard-"$(id -u)"
+    ├─→ 找到相同客户端/参数/工作目录/认证环境的上传连接？
+    │       PING 检测有效 → 复用（同图可直接返回缓存路径）
+    │       无连接/失效 → 使用原 OpenSSH，静默尝试密钥、agent、已有 WSL ControlPath
+    │       仅认证失败时 → SSH_ASKPASS 弹窗 → 保持认证后的连接
     │
-    ├─→ 读取回显的绝对路径
+    ├─→ PUT 长度 类型 转义文件名 → SEND → 原始文件字节 → OK 绝对路径
+    │       私有目录由 mktemp -d 创建，先写 .partial，再原子重命名
     │
-    └─→ 粘贴远程路径；失败则托盘气泡提示（含公钥配置提示）、不粘贴
+    └─→ 检查剪贴板与前台窗口 → 粘贴路径；失败/取消则提示，不粘贴
 ```
 
-ssh 以 `BatchMode=yes`、`ConnectTimeout=5`、`LogLevel=ERROR` 运行，整体 60 秒超时；子进程以 `CREATE_NO_WINDOW` 启动避免闪出控制台。托盘菜单可切换自动 / 关闭（持久化为 `remote_paste`）或固定某个会话。退出时对本会话上传的临时截图执行 `rm -f`。相关代码见 `rust/src/remote.rs`、`rust/src/foreground.rs`。
+首次静默尝试使用 `BatchMode=yes`（总计 20 秒）；需要认证时改为 `BatchMode=no`，允许 180 秒输入密码/口令。`ConnectTimeout=5`、`ServerAliveInterval=15`、`ServerAliveCountMax=2`；建立连接后每次传输超时为 60 秒。`-T` 禁止伪终端；禁用额外转发和 LocalCommand，保留认证/路由参数以及既有 ControlPath。Windows 复用发现的 ssh.exe；WSL 传入原进程的发行版、用户、工作目录和 `SSH_AUTH_SOCK`，并用 NUL 分隔解析 argv。
+
+`ssh_auth.rs` 在单实例检查和日志初始化前处理 askpass 子进程。Windows 直接运行当前 exe；WSL 通过权限 700 的临时脚本调用同一个 Windows exe。原生凭据窗口不保存密码；口令只写入 SSH 子进程的 stdout 管道，并清零应用侧缓冲。新指纹使用显式确认，变更指纹不放行。取消事件和父进程句柄负责在超时/退出后关闭残留认证进程。诊断日志不记录密码。
+
+`remote_transport.rs` 维护一条 SSH channel；`remote_worker.sh` 在服务器运行临时 shell，不安装服务。用 `head -c` 消费精确长度，文件名使用八进制编码，响应带每连接随机标记；响应与 stderr 均有大小上限。错误后丢弃整个连接，避免下一文件落入未结束的数据帧。截图以 `t` 前缀、普通文件以 `f` 前缀保存；远端 EXIT trap 只删截图和未完成文件。退出仅向已有连接发 QUIT，不新建连接或认证。网络异常时远端清理可能延迟至断线被发现。
+
+粘贴任务独立运行，托盘在认证期间保持响应；退出先取消粘贴任务，再关闭上传连接。窗口切换会暂停粘贴，剪贴板变更仍由原序号保护。测试见 [ssh-auth-testing.md](ssh-auth-testing.md)。
 
 #### 路径转换策略
 
@@ -222,18 +228,22 @@ Image written to temp/
     │
     ├─→ no session in the foreground tab (or tray set to off) ──→ paste local /mnt path
     │
-    ├─→ Already uploaded in this session? ──yes──→ reuse remote path
-    │                │no
-    ├─→ Spawn the discovered ssh (Windows: same ssh.exe / WSL: wsl.exe -e ssh) with the same args, local file as stdin
-    │       remote: mkdir -p DIR && cat > DIR/FILE && printf '%s\n' DIR/FILE
-    │       DIR = /tmp/wsl_clipboard-"$(id -u)"
+    ├─→ Match upload connection by client, arguments, cwd and authentication environment
+    │       PING succeeds → reuse (cached path for repeated images)
+    │       missing/dead → silently try key, agent or existing WSL ControlPath
+    │       authentication needed → SSH_ASKPASS dialog → keep the authenticated channel
     │
-    ├─→ Read back the echoed absolute path
+    ├─→ PUT size kind encoded-name → SEND → exact raw bytes → OK absolute-path
+    │       private mktemp directory; write .partial then rename atomically
     │
-    └─→ Paste the remote path; on failure show a tray balloon (with a public-key hint) and paste nothing
+    └─→ Check clipboard and foreground window → paste; on error/cancel, notify without pasting
 ```
 
-SSH runs with `BatchMode=yes`, `ConnectTimeout=5`, `LogLevel=ERROR` and a 60 s overall timeout; the child process is started with `CREATE_NO_WINDOW` so no console flashes. The tray submenu switches auto / off (persisted as `remote_paste`) or pins one session. On exit, temporary screenshots uploaded during the session are removed with `rm -f`. See `rust/src/remote.rs` and `rust/src/foreground.rs`.
+The initial `BatchMode=yes` attempt has a 20-second deadline; authentication fallback uses `BatchMode=no` and allows 180 seconds for input. Connect timeout is 5 seconds; server keepalives are 15 seconds with two missed replies allowed. Each transfer has a 60-second deadline. TTY allocation, additional forwarding and LocalCommand are disabled; authentication/routing options and existing ControlPath are retained. WSL invocations preserve the original distro, user, cwd, argv boundaries and SSH_AUTH_SOCK.
+
+`ssh_auth.rs` handles askpass before logging or single-instance checks. Windows launches the same executable; WSL uses a private mode-700 temporary shim. Native credential dialogs never persist passwords; secrets only cross SSH's stdout pipe and application buffers are zeroed. A cancellation event and parent-process handle close abandoned dialogs. Host verification remains enabled. `remote_transport.rs` bounds replies/stderr and discards a failed connection; `remote_worker.sh` uses length-framed binary input and atomic rename. Its EXIT trap deletes screenshots and partial files, retaining copied ordinary files. Shutdown only sends QUIT to existing channels, without authentication. Network failure can delay cleanup until the remote notices the disconnect.
+
+The paste task is cancellable so the tray remains responsive during authentication. Foreground changes pause paste; clipboard sequence checks remain in effect. See [ssh-auth-testing.md](ssh-auth-testing.md).
 
 #### Path Conversion Strategy
 

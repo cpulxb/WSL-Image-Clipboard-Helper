@@ -186,14 +186,6 @@ unsafe fn send_ime_control(ime_wnd: isize, sub_command: usize, lparam: isize) ->
     }
 }
 
-/// 粘贴文本到剪贴板并执行粘贴操作（文件列表使用）
-pub fn paste_text(text: &str) -> Result<()> {
-    if write_text(text, None)?.is_some() {
-        send_ctrl_v()?;
-    }
-    Ok(())
-}
-
 fn source_unchanged(expected: Option<u32>, actual: u32) -> bool {
     expected.map_or(true, |seq| seq != 0 && seq == actual)
 }
