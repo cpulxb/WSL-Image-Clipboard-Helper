@@ -34,7 +34,7 @@
 #### ✅ 解决方案
 本工具用于弥补这个缺口：通过全局快捷键（默认 `Alt+V`），自动读取 Windows 剪贴板图片，保存到本地 `temp/` 目录，并把对应 WSL 路径（`/mnt/c/...`）粘贴到当前输入窗口，让 AI 工具可以直接消费图片文件。
 
-当前版本为 Rust 实现的 `v4.2`，GitHub Release 提供预编译版本。
+当前版本为 Rust 实现的 `v4.2.1`，GitHub Release 提供预编译版本。
 
 ### ✨ 核心特性
 
@@ -92,7 +92,7 @@ WSL-Image-Clipboard-Helper/
 ### 🚀 使用方式（Rust 版本）
 
 1. 最简单方式（推荐）：从 GitHub Release 下载已编译版本：
-   - `v4.2`：[https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2)
+   - `v4.2.1`：[https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2.1](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2.1)
    - latest release：[https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest)
 
 2. 将下载的 `wsl_clipboard.exe` 放到一个固定目录。
@@ -146,11 +146,11 @@ WSL-Image-Clipboard-Helper/
 
 OpenSSH 日常用法：照常 SSH 登录，在远程 CLI 输入框按 `Alt+V`。程序自动识别当前终端 tab，沿用登录所用的客户端、用户、主机、端口、`-i` 密钥、`-J` 跳板及 SSH config 别名。
 
-**客户端有区别：发布版 v4.2 只识别 Windows / WSL OpenSSH；以下 MobaXterm 适配属于当前源码的新改动，旧版 exe 不包含。**
+**客户端有区别：v4.2 只识别 Windows / WSL OpenSSH；v4.2.1 新增以下 MobaXterm 适配，旧版 exe 不包含。**
 
 #### MobaXterm 与其他 SSH 客户端
 
-- **MobaXterm 内置 SSH（MoTTY）**：当前源码支持直接连接、指定本地 PEM / OpenSSH 密钥的保存会话。读取当前可见标签页的主机、用户、端口、密钥路径，通过 Windows 系统 OpenSSH 建立独立上传连接，使用 `Shift+Insert` 粘贴远程路径。MobaXterm 需启用该粘贴快捷键。
+- **MobaXterm 内置 SSH（MoTTY）**：v4.2.1 支持直接连接、指定本地 PEM / OpenSSH 密钥的保存会话。读取当前可见标签页的主机、用户、端口、密钥路径，通过 Windows 系统 OpenSSH 建立独立上传连接，使用 `Shift+Insert` 粘贴远程路径。MobaXterm 需启用该粘贴快捷键。
 - 需要 Windows 的 OpenSSH 客户端；首次上传可能要求确认主机指纹或输入密钥口令。OpenSSH 使用自己的主机信任记录，不能直接复用 MobaXterm 的信任记录、MobAgent、密码缓存或已登录的连接。上传连接建立后，后续图片继续复用它。
 - 私钥需满足 Windows OpenSSH 的权限要求。遇到 `bad permissions`，检查密钥 ACL，仅在明确授权后收紧多余账户的访问权限；程序不会复制私钥、修改 ACL 或放宽主机校验。
 - `.ppk`、未指定密钥的密码/MobAgent 登录、代理/跳板、自定义远程命令暂不自动转换，显示明确提示并停止粘贴；可使用 Windows / WSL OpenSSH。隐藏标签页不会被选中；同时可见多个 SSH 面板时要求在托盘固定目标，上传期间切换标签页会停止粘贴。
@@ -356,7 +356,14 @@ rustup target add x86_64-pc-windows-msvc
 
 ### 🕒 版本历史
 
-#### v4.2（当前版本，Rust） ✅
+#### v4.2.1（当前版本，Rust） ✅
+
+- 新增 MobaXterm 保存的 SSH 会话识别，支持直接连接及本地 PEM / OpenSSH 密钥
+- 修复远程上传成功但终端没有粘贴的问题：发送带扩展扫描码和正确修饰键时序的 `Shift+Insert`
+- 隐藏标签页不参与自动选择，上传期间切换标签页会停止粘贴；未支持的会话配置显示明确提示
+- 更新客户端兼容范围和验证记录，发布程序移除本机绝对编译路径
+
+#### v4.2（Rust） ✅
 
 - 新增远程粘贴：在终端里 SSH 到远程机器运行 CLI 时，先上传图片，再粘贴远程路径（#11）
 - 自动识别当前 tab 的交互式 SSH 会话，沿用客户端、用户、主机、端口、密钥、跳板和别名参数；本地 tab 继续使用本地路径
@@ -434,7 +441,7 @@ Many AI CLI agents (Codex, Amazon Q Developer CLI, OpenCode, Claude Code, etc.) 
 #### ✅ Solution
 This project automates that workaround with a global hotkey (default `Alt+V`): it captures clipboard image data, saves a PNG file, and pastes the WSL path (`/mnt/...`) into the active input control.
 
-The current Rust release is `v4.2`; prebuilt binaries are available on GitHub Releases.
+The current Rust release is `v4.2.1`; prebuilt binaries are available on GitHub Releases.
 
 ### ✨ Highlights
 
@@ -494,7 +501,7 @@ WSL-Image-Clipboard-Helper/
 ### 🚀 Usage (Rust version)
 
 1. Easiest way (recommended): download the prebuilt package from GitHub Releases:
-   - `v4.2`: [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2)
+   - `v4.2.1`: [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2.1](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2.1)
    - latest release: [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest)
 2. Put `wsl_clipboard.exe` in a fixed folder (ideally with `temp/` and `wsl_clipboard.toml`).
 3. Launch `wsl_clipboard.exe`.
@@ -523,7 +530,7 @@ For the case where you `ssh` from Windows Terminal / WSL into a server and run C
 
 For OpenSSH, log in normally, start your remote CLI, copy an image, and press `Alt+V`. The helper detects the current terminal tab and preserves the SSH client, user, host, port, identity file, jump host and config alias.
 
-**Client compatibility:** released v4.2 detects Windows/WSL OpenSSH only. Current source adds a MobaXterm adapter for saved, direct SSH sessions using a local PEM/OpenSSH key. It reads the visible MoTTY tab's host/user/port/key path, uploads through a separate Windows system OpenSSH connection, and pastes using `Shift+Insert` (which must be enabled). Hidden tabs are excluded; multiple visible SSH panes require pinning the target; changing tabs during upload stops the paste.
+**Client compatibility:** v4.2 detects Windows/WSL OpenSSH only. v4.2.1 adds a MobaXterm adapter for saved, direct SSH sessions using a local PEM/OpenSSH key. It reads the visible MoTTY tab's host/user/port/key path, uploads through a separate Windows system OpenSSH connection, and pastes using `Shift+Insert` (which must be enabled). Hidden tabs are excluded; multiple visible SSH panes require pinning the target; changing tabs during upload stops the paste.
 
 The MobaXterm adapter requires Windows OpenSSH and its normal private-key ACL checks. Its own known-host records apply, so the first upload may ask for host confirmation or a key passphrase. It cannot reuse MobaXterm passwords, MobAgent, trust records or the original connection. `.ppk`, sessions without an explicit key, proxies/jump hosts and custom remote commands show a limitation instead of pasting a local path. The helper does not change key permissions or invoke internal MobaSCP commands. Other embedded SSH clients (PuTTY, Xshell, SecureCRT, Termius) need separate adapters; an executable-name check alone does not provide support.
 
@@ -646,6 +653,7 @@ cargo clean
 
 ### 🕒 Version Line
 
+- `v4.2.1`: saved MobaXterm SSH sessions with PEM/OpenSSH keys, reliable extended `Shift+Insert` paste, visible-tab checks, explicit compatibility limits, and build-path privacy cleanup
 - `v4.2`: remote paste over SSH — auto-detects the open SSH session (Windows-side `ssh.exe` or WSL-side `ssh`), uploads the image with the same SSH arguments and pastes the remote path; tray auto/off/pin switch and remote cleanup on exit (#11)
 - `v4.1.3`: no more phantom `ENG` keyboard layout on startup — lazy English-layout resolution plus the new `ime_protection` setting (#10)
 - `v4.1.2`: dismiss the target window's menu mode (fast Alt release) before injecting Ctrl+V so pastes are not swallowed
