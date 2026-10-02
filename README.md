@@ -144,7 +144,19 @@ WSL-Image-Clipboard-Helper/
 
 **v4.2 支持远程图片上传、密码/密钥口令弹窗和持续连接复用。Windows 与 WSL 都可以按下面的步骤使用。**
 
-日常用法：照常 SSH 登录，在远程 CLI 输入框按 `Alt+V`。程序自动识别当前终端 tab，沿用登录所用的客户端、用户、主机、端口、`-i` 密钥、`-J` 跳板及 SSH config 别名。
+OpenSSH 日常用法：照常 SSH 登录，在远程 CLI 输入框按 `Alt+V`。程序自动识别当前终端 tab，沿用登录所用的客户端、用户、主机、端口、`-i` 密钥、`-J` 跳板及 SSH config 别名。
+
+**客户端有区别：发布版 v4.2 只识别 Windows / WSL OpenSSH；以下 MobaXterm 适配属于当前源码的新改动，旧版 exe 不包含。**
+
+#### MobaXterm 与其他 SSH 客户端
+
+- **MobaXterm 内置 SSH（MoTTY）**：当前源码支持直接连接、指定本地 PEM / OpenSSH 密钥的保存会话。读取当前可见标签页的主机、用户、端口、密钥路径，通过 Windows 系统 OpenSSH 建立独立上传连接，使用 `Shift+Insert` 粘贴远程路径。MobaXterm 需启用该粘贴快捷键。
+- 需要 Windows 的 OpenSSH 客户端；首次上传可能要求确认主机指纹或输入密钥口令。OpenSSH 使用自己的主机信任记录，不能直接复用 MobaXterm 的信任记录、MobAgent、密码缓存或已登录的连接。上传连接建立后，后续图片继续复用它。
+- 私钥需满足 Windows OpenSSH 的权限要求。遇到 `bad permissions`，检查密钥 ACL，仅在明确授权后收紧多余账户的访问权限；程序不会复制私钥、修改 ACL 或放宽主机校验。
+- `.ppk`、未指定密钥的密码/MobAgent 登录、代理/跳板、自定义远程命令暂不自动转换，显示明确提示并停止粘贴；可使用 Windows / WSL OpenSSH。隐藏标签页不会被选中；同时可见多个 SSH 面板时要求在托盘固定目标，上传期间切换标签页会停止粘贴。
+- **其他终端**：若实际调用 `ssh.exe` 或默认 WSL 的 `ssh`，可沿用 OpenSSH 识别；PuTTY、Xshell、SecureCRT、Termius 等自带 SSH 的客户端不能仅靠进程名自动通用，需要单独适配会话配置和粘贴方式。当前没有宣称支持这些客户端的自动上传。
+
+MobaXterm 适配不会调用其内部 `MobaSCP*` 命令，也不会从保存会话读取密码。实现将客户端配置转换与上传模块分开，后续可以新增适配器，共用现有上传、认证和清理逻辑。
 
 | 发起 SSH 的环境 | 密码登录 | 密钥登录 |
 | --- | --- | --- |
@@ -509,7 +521,11 @@ For the case where you `ssh` from Windows Terminal / WSL into a server and run C
 
 **v4.2 includes remote image uploads, password/passphrase dialogs and persistent upload connections for both Windows and WSL.**
 
-Log in normally, start your remote CLI, copy an image, and press `Alt+V`. The helper detects the current terminal tab and preserves the SSH client, user, host, port, identity file, jump host and config alias.
+For OpenSSH, log in normally, start your remote CLI, copy an image, and press `Alt+V`. The helper detects the current terminal tab and preserves the SSH client, user, host, port, identity file, jump host and config alias.
+
+**Client compatibility:** released v4.2 detects Windows/WSL OpenSSH only. Current source adds a MobaXterm adapter for saved, direct SSH sessions using a local PEM/OpenSSH key. It reads the visible MoTTY tab's host/user/port/key path, uploads through a separate Windows system OpenSSH connection, and pastes using `Shift+Insert` (which must be enabled). Hidden tabs are excluded; multiple visible SSH panes require pinning the target; changing tabs during upload stops the paste.
+
+The MobaXterm adapter requires Windows OpenSSH and its normal private-key ACL checks. Its own known-host records apply, so the first upload may ask for host confirmation or a key passphrase. It cannot reuse MobaXterm passwords, MobAgent, trust records or the original connection. `.ppk`, sessions without an explicit key, proxies/jump hosts and custom remote commands show a limitation instead of pasting a local path. The helper does not change key permissions or invoke internal MobaSCP commands. Other embedded SSH clients (PuTTY, Xshell, SecureCRT, Termius) need separate adapters; an executable-name check alone does not provide support.
 
 | SSH environment | Password login | Key login |
 | --- | --- | --- |

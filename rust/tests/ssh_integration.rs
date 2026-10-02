@@ -9,10 +9,28 @@ mod remote;
 mod remote_transport;
 #[path = "../src/ssh_auth.rs"]
 mod ssh_auth;
+#[path = "../src/ssh_clients.rs"]
+mod ssh_clients;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--inspect-moba") {
+        for session in remote::discover_sessions()
+            .into_iter()
+            .filter(|s| s.client == ssh_clients::Client::MobaXterm)
+        {
+            println!(
+                "MobaXterm pid={} target={} blocked={:?} visible_roots={:?}",
+                session.pid,
+                session.destination,
+                session.blocked,
+                foreground::test_embedded_roots(session.pid)
+            );
+            println!("Window diagnostics: {:?}", foreground::inspect_embedded_windows(session.pid));
+        }
+        return Ok(());
+    }
     let bridge = args.get(1).map(String::as_str) == Some("--ssh-askpass");
     if bridge || std::env::var_os("WSL_CLIPBOARD_ASKPASS").is_some() {
         if std::env::var_os("WCH_SSH_NATIVE_SMOKE").is_some() {

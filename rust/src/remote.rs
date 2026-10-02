@@ -53,6 +53,9 @@ impl SshBackend {
 /// 一个正在运行的交互式 ssh 会话
 #[derive(Debug, Clone)]
 pub struct SshSession {
+    pub client: crate::ssh_clients::Client,
+    /// 保留无法适配的会话，以便在对应标签页提示原因，不能误贴本地路径。
+    pub blocked: Option<String>,
     pub backend: SshBackend,
     pub pid: u32,
     /// ssh 的 destination 参数（`user@host` / 别名 / `ssh://...`），仅用于显示
@@ -79,12 +82,17 @@ impl SshSession {
     }
 
     pub fn label(&self) -> String {
-        format!("{}  ({})", self.destination, self.backend.display_name())
+        let client = match self.client {
+            crate::ssh_clients::Client::OpenSsh => self.backend.display_name(),
+            crate::ssh_clients::Client::MobaXterm => "MobaXterm → Windows OpenSSH",
+        };
+        format!("{}  ({})", self.destination, client)
     }
 
     /// 是否指向同一目标。忽略 pid：同一个 tab 断线重连后仍视为同一目标
     pub fn same_target(&self, other: &SshSession) -> bool {
-        self.backend == other.backend
+        self.client == other.client
+            && self.backend == other.backend
             && self.program == other.program
             && self.args == other.args
             && self.wsl_context == other.wsl_context
@@ -135,27 +143,37 @@ impl RemoteMode {
 
     /// 按当前模式解析这次粘贴要用的 ssh 会话；None = 粘贴本地路径。
     /// 会枚举进程（可能启动 wsl.exe）、探测前台 tab，请在阻塞线程上调用
-    pub fn resolve(&self) -> Option<SshSession> {
+    pub fn resolve(&self) -> Result<Option<SshSession>> {
         if matches!(self, RemoteMode::Off) {
-            return None;
+            return Ok(None);
         }
         let procs = process_snapshot();
         let sessions = discover_from(&procs);
         if let RemoteMode::Pinned(pinned) = self {
-            if let Some(s) = sessions.iter().find(|s| s.same_target(pinned)) {
-                return Some(s.clone());
+            let matching = || sessions.iter().filter(|s| s.same_target(pinned));
+            if let Some(s) = matching()
+                .find(|s| {
+                    s.client == crate::ssh_clients::Client::MobaXterm
+                        && foreground::embedded_session_active(s.pid)
+                })
+                .or_else(|| matching().next())
+            {
+                if let Some(reason) = &s.blocked {
+                    anyhow::bail!("{reason}");
+                }
+                return Ok(Some(s.clone()));
             }
             warn!("指定的 ssh 会话已关闭，退回自动选择: {}", pinned.label());
         }
         if sessions.is_empty() {
             info!("没有打开的 ssh 会话，粘贴本地路径");
-            return None;
+            return Ok(None);
         }
         let anchors = anchors_of(&sessions, &procs);
         let focus = foreground::classify(&anchors, &procs);
         for ((session, anchor), focus) in sessions.iter().zip(&anchors).zip(&focus) {
             let anchor_pid = match anchor {
-                Anchor::Process(pid) => Some(*pid),
+                Anchor::Process(pid) | Anchor::Embedded(pid) => Some(*pid),
                 Anchor::AnyWsl => None,
             };
             info!(
@@ -165,7 +183,23 @@ impl RemoteMode {
                 "SSH 会话与前台 tab 的匹配结果"
             );
         }
+        if sessions
+            .iter()
+            .zip(&focus)
+            .filter(|(s, f)| {
+                s.client == crate::ssh_clients::Client::MobaXterm && **f == Focus::Active
+            })
+            .count()
+            > 1
+        {
+            anyhow::bail!("发现多个可见的 MobaXterm SSH 面板，请在托盘中固定目标会话后重试。");
+        }
         let chosen = pick(sessions, &focus);
+        if let Some((s, _)) = &chosen {
+            if let Some(reason) = &s.blocked {
+                anyhow::bail!("{reason}");
+            }
+        }
         match &chosen {
             Some((s, Focus::Active)) => {
                 info!("前台 tab 中的 ssh 会话: {} (pid {})", s.label(), s.pid)
@@ -177,7 +211,7 @@ impl RemoteMode {
             ),
             None => info!("前台 tab 里没有 ssh 会话，粘贴本地路径"),
         }
-        chosen.map(|(s, _)| s)
+        Ok(chosen.map(|(s, _)| s))
     }
 }
 
@@ -196,21 +230,29 @@ fn anchors_of(sessions: &[SshSession], procs: &[ProcEntry]) -> Vec<Anchor> {
     let mut wsl_tabs: Option<Vec<(u32, String)>> = None;
     sessions
         .iter()
-        .map(|s| match (s.backend, &s.wt_session) {
-            (SshBackend::Windows, _) => Anchor::Process(s.pid),
-            (SshBackend::Wsl, Some(wt)) => {
-                let tabs = wsl_tabs.get_or_insert_with(|| {
-                    procs
-                        .iter()
-                        .filter(|p| p.exe.eq_ignore_ascii_case("wsl.exe"))
-                        .filter_map(|p| Some((p.pid, foreground::env_var(p.pid, "WT_SESSION")?)))
-                        .collect()
-                });
-                tabs.iter()
-                    .find(|(_, t)| t == wt)
-                    .map_or(Anchor::AnyWsl, |&(pid, _)| Anchor::Process(pid))
+        .map(|s| {
+            if s.client == crate::ssh_clients::Client::MobaXterm {
+                Anchor::Embedded(s.pid)
+            } else {
+                match (s.backend, &s.wt_session) {
+                    (SshBackend::Windows, _) => Anchor::Process(s.pid),
+                    (SshBackend::Wsl, Some(wt)) => {
+                        let tabs = wsl_tabs.get_or_insert_with(|| {
+                            procs
+                                .iter()
+                                .filter(|p| p.exe.eq_ignore_ascii_case("wsl.exe"))
+                                .filter_map(|p| {
+                                    Some((p.pid, foreground::env_var(p.pid, "WT_SESSION")?))
+                                })
+                                .collect()
+                        });
+                        tabs.iter()
+                            .find(|(_, t)| t == wt)
+                            .map_or(Anchor::AnyWsl, |&(pid, _)| Anchor::Process(pid))
+                    }
+                    (SshBackend::Wsl, None) => Anchor::AnyWsl,
+                }
             }
-            (SshBackend::Wsl, None) => Anchor::AnyWsl,
         })
         .collect()
 }
@@ -259,8 +301,14 @@ pub fn process_snapshot() -> Vec<ProcEntry> {
 fn discover_windows(procs: &[ProcEntry]) -> Vec<SshSession> {
     procs
         .iter()
-        .filter(|p| p.exe.eq_ignore_ascii_case("ssh.exe"))
-        .filter_map(|p| unsafe { inspect_windows_process(p.pid) })
+        .filter(|p| crate::ssh_clients::Client::from_executable(&p.exe).is_some())
+        .filter_map(|p| {
+            unsafe { inspect_windows_process(p.pid) }.or_else(|| {
+                p.exe
+                    .eq_ignore_ascii_case("motty.exe")
+                    .then(|| moba_session(p.pid, &[], 0))
+            })
+        })
         .collect()
 }
 
@@ -354,6 +402,10 @@ unsafe fn inspect_windows_process(pid: u32) -> Option<SshSession> {
             0
         };
 
+        let client = crate::ssh_clients::Client::from_executable(program.file_name()?.to_str()?)?;
+        if client == crate::ssh_clients::Client::MobaXterm {
+            return Some(moba_session(pid, argv.get(1..)?, started));
+        }
         let mut session =
             session_from_argv(SshBackend::Windows, pid, program, argv.get(1..)?, started)?;
         session.auth_sock = foreground::env_var(pid, "SSH_AUTH_SOCK");
@@ -482,6 +534,8 @@ fn session_from_argv(
 ) -> Option<SshSession> {
     let (args, destination) = parse_ssh_args(argv)?;
     Some(SshSession {
+        client: crate::ssh_clients::Client::OpenSsh,
+        blocked: None,
         backend,
         pid,
         destination,
@@ -493,6 +547,26 @@ fn session_from_argv(
         cwd: None,
         auth_sock: None,
     })
+}
+
+fn moba_session(pid: u32, argv: &[String], started: u64) -> SshSession {
+    let mut session = session_from_argv(
+        SshBackend::Windows,
+        pid,
+        crate::ssh_clients::windows_openssh(),
+        &["MobaXterm".into()],
+        started,
+    )
+    .unwrap();
+    session.client = crate::ssh_clients::Client::MobaXterm;
+    match crate::ssh_clients::moba_options(argv) {
+        Ok(options) => {
+            session.args = options.args;
+            session.destination = options.label;
+        }
+        Err(e) => session.blocked = Some(format!("MobaXterm：{e:#}")),
+    }
+    session
 }
 
 /// 带参数的 ssh 选项字母（见 `ssh` 用法一行）
@@ -595,6 +669,9 @@ impl RemoteUploader {
         local: &Path,
         temp_image: bool,
     ) -> Result<String> {
+        if let Some(reason) = &session.blocked {
+            anyhow::bail!("{reason}");
+        }
         let mut pool = self.connections.lock().await;
         let existing = pool.iter().position(|c| c.session.same_target(session));
         let index = if let Some(i) = existing {

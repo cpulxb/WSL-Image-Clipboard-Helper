@@ -16,6 +16,7 @@ mod paste;
 mod remote;
 mod remote_transport;
 mod ssh_auth;
+mod ssh_clients;
 mod tray;
 
 use clipboard::ClipboardManager;
@@ -298,7 +299,7 @@ async fn handle_paste(
     mode: &RuntimeMode,
     path_style: PathStyle,
     ime_protection: ImeProtection,
-    session: JoinHandle<Option<SshSession>>,
+    session: JoinHandle<Result<Option<SshSession>>>,
 ) -> Result<()> {
     let paste_window = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
     // 0. 立即注入菜单屏蔽键：赶在物理 Alt 抬起之前，
@@ -319,7 +320,7 @@ async fn handle_paste(
         if clipboard_manager.has_file_list() {
             let file_source_seq =
                 unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
-            let remote = session.await.unwrap_or(None);
+            let remote = resolve_paste_session(session).await?;
             let paths = match remote.as_ref() {
                 // 发现了 ssh 会话：Explorer 里复制的文件同样上传过去，粘贴远程路径
                 Some(target) => match clipboard_manager.read_file_list_raw() {
@@ -339,6 +340,7 @@ async fn handle_paste(
                 if !still_in_paste_window(paste_window) {
                     return Ok(());
                 }
+                ensure_target_tab(remote.as_ref())?;
                 let paste_text = path_style.format_paths(&wsl_paths);
 
                 let _ime_guard = match mode {
@@ -348,14 +350,14 @@ async fn handle_paste(
 
                 info!("粘贴文件路径: {}", paste_text);
                 if paste::write_text(&paste_text, Some(file_source_seq))?.is_some() {
-                    paste::send_ctrl_v()?;
+                    paste::send_paste()?;
                 }
                 return Ok(());
             }
         }
 
         info!("剪贴板无图片，执行普通粘贴");
-        paste::send_ctrl_v()?;
+        paste::send_paste()?;
         return Ok(());
     };
 
@@ -377,8 +379,9 @@ async fn handle_paste(
 
     // 3b. 发现了 ssh 会话（issue #11）：先把图片 ssh 上传到远程，再粘贴远程路径；
     //     上传失败时不粘贴任何内容——本地 /mnt 路径在远程终端里没有意义
-    let paste_path = match session.await.unwrap_or(None) {
-        Some(target) => match uploader.upload(&target, &win_path, true).await {
+    let target = resolve_paste_session(session).await?;
+    let paste_path = match target.as_ref() {
+        Some(target) => match uploader.upload(target, &win_path, true).await {
             Ok(remote_path) => remote_path,
             Err(e) => {
                 report_remote_failure(&target, &e);
@@ -392,6 +395,7 @@ async fn handle_paste(
     if !still_in_paste_window(paste_window) {
         return Ok(());
     }
+    ensure_target_tab(target.as_ref())?;
     let _ime_guard = match mode {
         RuntimeMode::Safe => Some(paste::ImeGuard::new(ime_protection)),
         RuntimeMode::Fast => None,
@@ -405,10 +409,40 @@ async fn handle_paste(
         return Ok(());
     };
     clipboard_manager.record_image_text(source_seq, written_seq, &paste_text);
-    paste::send_ctrl_v()?;
+    paste::send_paste()?;
 
     // 6. ImeGuard 在此处 drop，触发 120ms 后恢复输入法
 
+    Ok(())
+}
+
+async fn resolve_paste_session(
+    task: JoinHandle<Result<Option<SshSession>>>,
+) -> Result<Option<SshSession>> {
+    match task.await {
+        Ok(Ok(session)) => Ok(session),
+        result => {
+            let message = match result {
+                Ok(Err(e)) => format!("{e:#}"),
+                Err(e) => format!("无法识别当前 SSH 会话：{e}"),
+                _ => unreachable!(),
+            };
+            tray::notify_warning("远程粘贴未完成", &message);
+            anyhow::bail!("{message}")
+        }
+    }
+}
+
+fn ensure_target_tab(target: Option<&SshSession>) -> Result<()> {
+    if let Some(target) = target {
+        if target.client == ssh_clients::Client::MobaXterm
+            && !foreground::embedded_session_active(target.pid)
+        {
+            let message = "MobaXterm 标签页已变化，请回到原 SSH 标签页再次按热键。";
+            tray::notify_warning("已暂停粘贴", message);
+            anyhow::bail!("{message}");
+        }
+    }
     Ok(())
 }
 

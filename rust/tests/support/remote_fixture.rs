@@ -145,6 +145,43 @@ pub async fn run_auth_fixture(dir: &Path) -> Result<()> {
             }
         }
     }
+    if let Ok(name) = std::env::var("WCH_MOBA_TEST_SESSION") {
+        // The caller creates a disposable registry profile pointed only at this fixture.
+        let mut session = moba_session(1, &["-load".into(), name], 0);
+        assert!(session.blocked.is_none(), "{:?}", session.blocked);
+        assert!(session.destination.starts_with("fixture@127.0.0.1:"));
+        session.args.splice(
+            0..0,
+            [
+                "-o".into(),
+                format!("UserKnownHostsFile={}", dir.join("known_hosts").display()),
+                "-o".into(),
+                "StrictHostKeyChecking=yes".into(),
+            ],
+        );
+        let before = prompt_count();
+        let uploader = RemoteUploader::new();
+        let first = uploader.upload(&session, &local, true).await?;
+        session.pid = 2;
+        assert_eq!(uploader.upload(&session, &local, true).await?, first);
+        assert_eq!(uploader.connections.lock().await.len(), 1);
+        uploader.cleanup_on_exit().await;
+        assert_eq!(prompt_count(), before);
+        println!("PASS MobaXterm registry adapter: key, port, user, host, upload, cache, connection reuse, cleanup");
+        session.args.splice(
+            0..0,
+            [
+                "-o".into(),
+                format!("UserKnownHostsFile={}", dir.join("wrong_hosts").display()),
+            ],
+        );
+        assert!(RemoteUploader::new()
+            .upload(&session, &local, true)
+            .await
+            .is_err());
+        assert_eq!(prompt_count(), before);
+        println!("PASS MobaXterm adapter: changed host key rejected without authentication dialog");
+    }
     let _ = std::fs::remove_file(prompts);
     Ok(())
 }

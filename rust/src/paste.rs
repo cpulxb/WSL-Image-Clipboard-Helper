@@ -9,6 +9,7 @@ use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, Global
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_SCANCODE,
     VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_LMENU, VK_MENU, VK_RMENU, VK_SHIFT, VK_V,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -430,18 +431,110 @@ pub fn release_all_modifiers() {
 
 /// 发送 Ctrl+V 粘贴快捷键（使用 SendInput 替代 keybd_event）
 pub fn send_ctrl_v() -> Result<()> {
+    send_paste_keys(VK_CONTROL, VK_V)
+}
+
+/// 图形 SSH 客户端的 Ctrl+V 通常被发送到远端；用其本地文本粘贴键。
+pub fn send_paste() -> Result<()> {
+    if crate::foreground::foreground_uses_shift_insert() {
+        send_shift_insert()
+    } else {
+        send_ctrl_v()
+    }
+}
+
+/// The dedicated Insert key uses the extended scan code E0 52.
+/// Keep Shift down across the key event, as with a physical chord. A single
+/// all-at-once batch can already have released Shift when a terminal queries it.
+fn send_shift_insert() -> Result<()> {
+    let window = unsafe { GetForegroundWindow() };
+    wait_modifiers_released(250);
+    release_all_modifiers();
+    dismiss_menu_mode_if_active();
+    if unsafe { GetForegroundWindow() } != window {
+        bail!("发送粘贴按键前窗口已变化，请回到原终端重试");
+    }
+    let inputs = shift_insert_inputs();
+    info!("发送终端粘贴按键: Shift+Insert，扫描码 E0 52");
+    send_key_inputs(&inputs[..1])?;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let result = if unsafe { GetForegroundWindow() } == window {
+        send_key_inputs(&inputs[1..3])
+    } else {
+        Err(anyhow::anyhow!("按键期间窗口已变化，已取消粘贴"))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    // Always release Shift, including failed or cancelled input.
+    let release = send_key_inputs(&inputs[3..]);
+    result?;
+    release
+}
+
+fn shift_insert_inputs() -> [INPUT; 4] {
+    let scan = |code, extended, up| {
+        let mut input = make_key_input(VIRTUAL_KEY(0), up);
+        unsafe {
+            input.Anonymous.ki.wScan = code;
+            input.Anonymous.ki.dwFlags |= KEYEVENTF_SCANCODE;
+            if extended { input.Anonymous.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY; }
+        }
+        input
+    };
+    [scan(0x2a, false, false), scan(0x52, true, false),
+        scan(0x52, true, true), scan(0x2a, false, true)]
+}
+
+#[cfg(test)]
+mod terminal_key_tests {
+    use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VSC_TO_VK_EX, VK_INSERT, VK_LSHIFT};
+
+    #[test]
+    fn terminal_chord_decodes_as_left_shift_and_extended_insert() {
+        let events = shift_insert_inputs();
+        let mut pressed = Vec::new();
+        for event in events {
+            let key = unsafe { event.Anonymous.ki };
+            assert!(key.dwFlags.contains(KEYEVENTF_SCANCODE));
+            let scan = key.wScan as u32 | if key.dwFlags.contains(KEYEVENTF_EXTENDEDKEY) { 0xe000 } else { 0 };
+            let vk = unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX) };
+            assert!(vk == VK_INSERT.0 as u32 || vk == VK_LSHIFT.0 as u32);
+            if vk == VK_INSERT.0 as u32 { assert!(key.dwFlags.contains(KEYEVENTF_EXTENDEDKEY)); }
+            if key.dwFlags.contains(KEYEVENTF_KEYUP) {
+                assert_eq!(pressed.pop(), Some(vk));
+            } else {
+                if vk == VK_INSERT.0 as u32 { assert_eq!(pressed, [VK_LSHIFT.0 as u32]); }
+                pressed.push(vk);
+            }
+        }
+        assert!(pressed.is_empty());
+        // Check against Windows' decoder, not a copy of our constructor.
+        assert_eq!(unsafe { MapVirtualKeyW(0xe052, MAPVK_VSC_TO_VK_EX) }, VK_INSERT.0 as u32);
+    }
+}
+
+fn send_key_inputs(inputs: &[INPUT]) -> Result<()> {
+    let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent != inputs.len() as u32 {
+        bail!("SendInput 发送失败，期望 {} 实际 {}", inputs.len(), sent);
+    }
+    Ok(())
+}
+
+fn send_paste_keys(modifier: VIRTUAL_KEY, key: VIRTUAL_KEY) -> Result<()> {
     // 先给用户留出松开热键的时间（Alt+V/Alt+Enter 的 Alt 尚未抬起时，
     // 注入的 Ctrl+V 会被识别成 Ctrl+Alt+V 而失效）
     wait_modifiers_released(250);
     release_all_modifiers();
     // Alt 已被松开且菜单栏被激活时，Ctrl+V 会发进菜单而不是输入框
     dismiss_menu_mode_if_active();
+    info!("发送粘贴按键: Ctrl+V");
 
     let inputs = [
-        make_key_input(VK_CONTROL, false), // Ctrl down
-        make_key_input(VK_V, false),       // V down
-        make_key_input(VK_V, true),        // V up
-        make_key_input(VK_CONTROL, true),  // Ctrl up
+        make_key_input(modifier, false),
+        make_key_input(key, false),
+        make_key_input(key, true),
+        make_key_input(modifier, true),
     ];
 
     unsafe {

@@ -24,8 +24,8 @@ use windows::Win32::System::Console::{
     STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, GA_ROOTOWNER,
+    EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindowVisible, GA_ROOT, GA_ROOTOWNER,
 };
 
 use crate::remote::ProcEntry;
@@ -43,6 +43,8 @@ pub enum Focus {
 
 /// 用来定位会话所在控制台的 Windows 进程
 pub enum Anchor {
+    /// 嵌入客户端的终端子窗口；隐藏标签页绝不能作为候选。
+    Embedded(u32),
     /// 与会话共用控制台的进程：Windows ssh 即其自身；WSL ssh 为同一 tab（WT_SESSION 相同）的 wsl.exe
     Process(u32),
     /// 对应不到具体进程（WSL 会话不在 WT 里、在 tmux 里等）：只能看前台程序下有没有 wsl.exe
@@ -101,6 +103,7 @@ pub fn classify(anchors: &[Anchor], procs: &[ProcEntry]) -> Vec<Focus> {
                         .iter()
                         .any(|p| p.exe.eq_ignore_ascii_case("wsl.exe") && in_fg_app(p.pid)),
                 ),
+                Anchor::Embedded(pid) => (None, embedded_in_window(pid, fg)),
             })
             .collect();
 
@@ -122,11 +125,95 @@ pub fn classify(anchors: &[Anchor], procs: &[ProcEntry]) -> Vec<Focus> {
             .zip(facts)
             .map(|(anchor, (console, hosted))| match anchor {
                 Anchor::Process(_) => decide(active, console, hosted),
+                Anchor::Embedded(_) if hosted => Focus::Active,
+                Anchor::Embedded(_) => Focus::Inactive,
                 // 对应不到 tab：不猜，前台程序里有 WSL 就按旧行为算候选
                 Anchor::AnyWsl if hosted => Focus::Maybe,
                 Anchor::AnyWsl => Focus::Inactive,
             })
             .collect()
+    }
+}
+
+/// MobaXterm 将每个 MoTTY 终端嵌入为独立的子窗口，切换标签页会隐藏旧窗口。
+pub fn embedded_session_active(pid: u32) -> bool {
+    unsafe { embedded_in_window(pid, GetForegroundWindow()) }
+}
+
+#[cfg(test)]
+pub fn test_embedded_roots(pid: u32) -> Vec<String> {
+    unsafe {
+        top_level_windows()
+            .into_iter()
+            .filter(|&root| embedded_in_window(pid, root))
+            .map(|root| class_name(root))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+pub fn inspect_embedded_windows(pid: u32) -> Vec<String> {
+    unsafe {
+        let mut result = Vec::new();
+        for root in top_level_windows() {
+            if !embedded_in_window(pid, root) { continue; }
+            let mut children = Vec::<HWND>::new();
+            unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> BOOL {
+                (*(data.0 as *mut Vec<HWND>)).push(hwnd);
+                BOOL(1)
+            }
+            let _ = EnumChildWindows(root, Some(collect), LPARAM(&mut children as *mut _ as isize));
+            result.push(format!("root={} pid={}", class_name(root), window_pid(root)));
+            for child in children {
+                if window_pid(child) == pid {
+                    result.push(format!("child={} visible={}", class_name(child), IsWindowVisible(child).as_bool()));
+                }
+            }
+        }
+        result
+    }
+}
+
+unsafe fn embedded_in_window(pid: u32, foreground: HWND) -> bool {
+    if foreground.0 == 0 {
+        return false;
+    }
+    let mut children = Vec::<HWND>::new();
+    unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> BOOL {
+        (*(data.0 as *mut Vec<HWND>)).push(hwnd);
+        BOOL(1)
+    }
+    let _ = EnumChildWindows(
+        foreground,
+        Some(collect),
+        LPARAM(&mut children as *mut _ as isize),
+    );
+    children.push(foreground);
+    children.into_iter().any(|window| {
+        window_pid(window) == pid
+            && IsWindowVisible(window).as_bool()
+            && GetAncestor(window, GA_ROOT) == foreground
+    })
+}
+
+/// 只读取窗口类，不激活或修改用户窗口。
+pub fn foreground_uses_shift_insert() -> bool {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0 == 0 {
+            return false;
+        }
+        let mut classes = Vec::<HWND>::new();
+        unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> BOOL {
+            (*(data.0 as *mut Vec<HWND>)).push(hwnd);
+            BOOL(1)
+        }
+        let _ = EnumChildWindows(fg, Some(collect), LPARAM(&mut classes as *mut _ as isize));
+        classes.push(fg);
+        classes.into_iter().any(|hwnd| {
+            IsWindowVisible(hwnd).as_bool()
+                && matches!(class_name(hwnd).as_str(), "CMoTTY" | "PuTTY")
+        })
     }
 }
 

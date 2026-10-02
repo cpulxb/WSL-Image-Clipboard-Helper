@@ -8,6 +8,22 @@
 
 用户随后在日常环境试用并反馈未发现问题；该反馈不等同于以下全部场景均已人工覆盖。
 
+## MobaXterm 适配（2026-10-02，尚未发布）
+
+- Windows 单元测试：31 项通过，1 项已有隔离剪贴板测试默认忽略。覆盖主机、用户名、端口、含空格的密钥路径、MobaXterm 路径转义、终端粘贴扫描码及修饰键顺序，以及拒绝未支持的代理、密钥格式和命令行覆盖。
+- 本机回环 SSH 集成检查：19 项通过，含既有的 17 项 Windows/WSL 检查，以及读取临时 MobaXterm 注册表会话后实际上传/缓存/连接复用/清理、拒绝变更的服务器主机密钥两项。仅使用一次性测试密钥、独立 known_hosts 和 `127.0.0.1`。
+- 只读检查确认实际 MoTTY 进程、保存会话参数和可见子窗口可被识别，不向终端发送按键，不建立上传连接。
+- MobaXterm + 远程 Linux + PEM 密钥登录场景的人工验收通过：`Alt+V` 上传后，远端 Claude Code 显示图片附件。多标签页/多面板切换、首次主机指纹对话框的完整交互和其他 MobaXterm 版本仍未完成专项人工验收。
+- 正式实现使用系统 OpenSSH，不调用 MobaXterm 内部传输程序，不修改密钥权限。
+
+终端粘贴使用独立 Insert 的扩展扫描码 `E0 52`，分开发送 Shift 按下、Insert、Shift 松开。自动测试通过 Windows 的扫描码映射接口验证按键标识和修饰键顺序；人工验收同时覆盖实际上传与终端图片识别。个人服务器信息、密钥路径、截图及运行日志不随仓库提交。
+
+本次提交的 exe 使用相同功能代码重新构建，通过 Rust 的 `--remap-path-prefix` 将本机绝对编译路径替换为中性目录；不包含测试凭据或诊断测试入口。隐私检查范围为本次提交的文本、二进制文件和提交身份，不涉及改写已有 Git 历史。
+
+复测 MobaXterm 集成：在 `HKCU\Software\MobaXterm\MoTTY\Sessions` 下创建一个**全新、一次性**测试项（不要修改真实会话），填写 `Protocol=ssh`、`HostName=127.0.0.1`、`UserName=fixture`、测试服务实际 `PortNumber`、`PublicKeyFile` 为测试目录中的 `plain`、`ProxyMethod=0`、`PasteUsingShiftInsert=1`，空 `TunneledHostname` 和 `RemoteCommand`。将该项名称设为 `WCH_MOBA_TEST_SESSION`，同时设置下文的 `WCH_SSH_TEST_DIR`，运行集成测试。测试仅为该连接指定独立的 known_hosts；结束后删除测试项。
+
+测试程序的 `--inspect-moba` 参数只读取当前 MoTTY 会话与窗口归属，不上传或粘贴；该入口不包含在正式程序中。测试服务初始 ControlMaster 的空闲寿命为 10 分钟，准备过程超过它时应先重建测试 master，再验证 `Wsl reused` 用例。
+
 ## 已验证的内容
 
 - Windows OpenSSH 9.5 与默认 WSL 的 OpenSSH 都运行真实客户端，连接本机回环地址上的临时 Paramiko SSH 服务。
@@ -21,8 +37,8 @@
 
 ## 验证边界
 
-- 原生凭据窗口的人手输入、窗口焦点恢复与终端内 `[Image #n]` 的最终显示，需要在日常终端做一次人工验收；上述自动测试没有模拟人在凭据窗口里输入。
-- 未在真实外部服务器、企业 MFA/硬件密钥、Git 自带 SSH 或多层跳板环境中验收。OpenSSH 仍负责原有认证与路由，参数保持透传。
+- 上述自动测试没有模拟人在凭据窗口里输入；MobaXterm + 远程 Linux 的终端图片显示已通过人工验收，其余环境的窗口焦点恢复和完整认证交互仍需分别验收。
+- 外部服务器人工验收目前覆盖 PEM 密钥连接；企业 MFA/硬件密钥、Git 自带 SSH 或多层跳板环境尚未验收。OpenSSH 会话仍由原客户端负责认证与路由，参数保持透传；MobaXterm 适配的范围见上文。
 - WSL 会话发现仍只扫描默认发行版的默认用户。密码窗口需要启用 WSL Windows interop；已授权密钥、agent 或已有复用连接的静默路径不需要认证桥。
 
 ## 重跑单元测试
