@@ -742,7 +742,7 @@ async fn connect_attempt(
     let token = format!("WCH{:032x}", windows::core::GUID::new()?.to_u128());
     let worker = format!(
         "sh -c {} sh {}",
-        sh_quote(crate::remote_transport::WORKER),
+        sh_quote(&crate::remote_transport::worker_script()),
         sh_quote(&token)
     );
     let mut auth = crate::ssh_auth::Askpass::new(session.label(), silent)?;

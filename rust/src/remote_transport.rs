@@ -9,6 +9,19 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 
 pub const WORKER: &str = include_str!("remote_worker.sh");
+
+/// Returns the worker script with CR stripped.
+///
+/// `include_str!` embeds the file exactly as checked out; a Windows build
+/// machine with `core.autocrlf=true` checks the script out with CRLF line
+/// endings, so line 2 becomes `set -eu\r`. Remote shells treat the trailing
+/// `\r` as an invalid option (dash: `set: Illegal option`, bash:
+/// `set: invalid option`) and exit, closing the upload connection. Stripping
+/// `\r` at runtime makes the script work on any checkout and any remote sh.
+pub fn worker_script() -> String {
+    WORKER.replace('\r', "")
+}
+
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct Uploaded {
@@ -239,7 +252,8 @@ mod tests {
         };
         #[cfg(not(windows))]
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", WORKER, "sh", token]);
+        let script = worker_script();
+        cmd.args(["-c", &script, "sh", token]);
         cmd
     }
 

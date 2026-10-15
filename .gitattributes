@@ -1,0 +1,5 @@
+# Force LF on checkout for shell scripts. remote_worker.sh is embedded via
+# include_str! and executed by the remote sh; a CRLF checkout (Windows build
+# machines with core.autocrlf=true) turns `set -eu` into `set -eu\r`, which
+# dash and bash both reject as an invalid option and the upload fails.
+*.sh text eol=lf
