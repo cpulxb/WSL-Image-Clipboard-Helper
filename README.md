@@ -34,7 +34,7 @@
 #### ✅ 解决方案
 本工具用于弥补这个缺口：通过全局快捷键（默认 `Alt+V`），自动读取 Windows 剪贴板图片，保存到本地 `temp/` 目录，并把对应 WSL 路径（`/mnt/c/...`）粘贴到当前输入窗口，让 AI 工具可以直接消费图片文件。
 
-当前版本为 Rust 实现的 `v4.2.1`，GitHub Release 提供预编译版本。
+当前版本为 Rust 实现的 `v4.2.2`，GitHub Release 提供预编译版本。
 
 ### ✨ 核心特性
 
@@ -92,7 +92,7 @@ WSL-Image-Clipboard-Helper/
 ### 🚀 使用方式（Rust 版本）
 
 1. 最简单方式（推荐）：从 GitHub Release 下载已编译版本：
-   - `v4.2.1`：[https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2.1](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2.1)
+   - `v4.2.2`：[https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2.2](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2.2)
    - latest release：[https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest)
 
 2. 将下载的 `wsl_clipboard.exe` 放到一个固定目录。
@@ -356,7 +356,11 @@ rustup target add x86_64-pc-windows-msvc
 
 ### 🕒 版本历史
 
-#### v4.2.1（当前版本，Rust） ✅
+#### v4.2.2（当前版本，Rust） ✅
+
+- 修复 Ubuntu/Debian 等服务器上远程粘贴失败（`set: Illegal option`）：内嵌远程 worker 脚本去除 CRLF 行尾，并用 `.gitattributes` 保证 `.sh` 为 LF（#11, #12，感谢 [@nomind2think](https://github.com/nomind2think)）
+
+#### v4.2.1（Rust） ✅
 
 - 新增 MobaXterm 保存的 SSH 会话识别，支持直接连接及本地 PEM / OpenSSH 密钥
 - 修复远程上传成功但终端没有粘贴的问题：发送带扩展扫描码和正确修饰键时序的 `Shift+Insert`
@@ -441,7 +445,7 @@ Many AI CLI agents (Codex, Amazon Q Developer CLI, OpenCode, Claude Code, etc.) 
 #### ✅ Solution
 This project automates that workaround with a global hotkey (default `Alt+V`): it captures clipboard image data, saves a PNG file, and pastes the WSL path (`/mnt/...`) into the active input control.
 
-The current Rust release is `v4.2.1`; prebuilt binaries are available on GitHub Releases.
+The current Rust release is `v4.2.2`; prebuilt binaries are available on GitHub Releases.
 
 ### ✨ Highlights
 
@@ -501,7 +505,7 @@ WSL-Image-Clipboard-Helper/
 ### 🚀 Usage (Rust version)
 
 1. Easiest way (recommended): download the prebuilt package from GitHub Releases:
-   - `v4.2.1`: [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2.1](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2.1)
+   - `v4.2.2`: [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2.2](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/tag/v4.2.2)
    - latest release: [https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest](https://github.com/cpulxb/WSL-Image-Clipboard-Helper/releases/latest)
 2. Put `wsl_clipboard.exe` in a fixed folder (ideally with `temp/` and `wsl_clipboard.toml`).
 3. Launch `wsl_clipboard.exe`.
@@ -653,6 +657,7 @@ cargo clean
 
 ### 🕒 Version Line
 
+- `v4.2.2`: fix remote paste failing on dash/bash servers (`set: Illegal option`) caused by CRLF in the embedded worker script (#11, #12, thanks [@nomind2think](https://github.com/nomind2think))
 - `v4.2.1`: saved MobaXterm SSH sessions with PEM/OpenSSH keys, reliable extended `Shift+Insert` paste, visible-tab checks, explicit compatibility limits, and build-path privacy cleanup
 - `v4.2`: remote paste over SSH — auto-detects the open SSH session (Windows-side `ssh.exe` or WSL-side `ssh`), uploads the image with the same SSH arguments and pastes the remote path; tray auto/off/pin switch and remote cleanup on exit (#11)
 - `v4.1.3`: no more phantom `ENG` keyboard layout on startup — lazy English-layout resolution plus the new `ime_protection` setting (#10)
